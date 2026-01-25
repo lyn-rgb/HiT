@@ -1,0 +1,148 @@
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+import io
+import os
+from bisect import bisect_right
+from glob import glob
+from typing import List, Optional, Tuple
+
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+
+try:
+    import pyarrow.parquet as pq
+except ModuleNotFoundError as exc:
+    pq = None
+    _PARQUET_IMPORT_ERROR = exc
+else:
+    _PARQUET_IMPORT_ERROR = None
+
+
+def _resolve_parquet_files(path: str) -> List[str]:
+    if os.path.isdir(path):
+        files = sorted(glob(os.path.join(path, "*.parquet")))
+    else:
+        files = sorted(glob(path))
+        if not files and os.path.isfile(path) and path.endswith(".parquet"):
+            files = [path]
+    if not files:
+        raise FileNotFoundError(f"No parquet files found at {path}")
+    return files
+
+
+class ParquetImageDataset(Dataset):
+    def __init__(
+        self,
+        path: str,
+        transform=None,
+        image_key: str = "image",
+        label_key: str = "label",
+    ):
+        if _PARQUET_IMPORT_ERROR is not None:
+            raise ModuleNotFoundError("pyarrow is required for parquet datasets") from _PARQUET_IMPORT_ERROR
+
+        self.files = _resolve_parquet_files(path)
+        self.transform = transform
+        self.image_key = image_key
+        self.label_key = label_key
+
+        self._file_row_group_counts: List[List[int]] = []
+        self._file_row_group_offsets: List[List[int]] = []
+        self._file_total_rows: List[int] = []
+
+        for file_path in self.files:
+            pf = pq.ParquetFile(file_path)
+            row_group_counts = [pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups)]
+            offsets = []
+            running = 0
+            for count in row_group_counts:
+                running += count
+                offsets.append(running)
+            self._file_row_group_counts.append(row_group_counts)
+            self._file_row_group_offsets.append(offsets)
+            self._file_total_rows.append(running)
+
+        self._cum_file_rows: List[int] = []
+        total = 0
+        for rows in self._file_total_rows:
+            total += rows
+            self._cum_file_rows.append(total)
+
+        self._cache_file_idx: Optional[int] = None
+        self._cache_row_group_idx: Optional[int] = None
+        self._cache_cols: Optional[dict] = None
+
+    def __len__(self) -> int:
+        return self._cum_file_rows[-1] if self._cum_file_rows else 0
+
+    def _load_row_group(self, file_idx: int, row_group_idx: int) -> dict:
+        if (
+            self._cache_file_idx == file_idx
+            and self._cache_row_group_idx == row_group_idx
+            and self._cache_cols is not None
+        ):
+            return self._cache_cols
+
+        pf = pq.ParquetFile(self.files[file_idx])
+        table = pf.read_row_group(row_group_idx, columns=[self.image_key, self.label_key])
+        cols = table.to_pydict()
+        self._cache_file_idx = file_idx
+        self._cache_row_group_idx = row_group_idx
+        self._cache_cols = cols
+        return cols
+
+    def _resolve_index(self, idx: int) -> Tuple[int, int, int]:
+        if idx < 0:
+            idx = len(self) + idx
+        if idx < 0 or idx >= len(self):
+            raise IndexError("Index out of range")
+
+        file_idx = bisect_right(self._cum_file_rows, idx)
+        file_start = 0 if file_idx == 0 else self._cum_file_rows[file_idx - 1]
+        local_idx = idx - file_start
+
+        row_group_offsets = self._file_row_group_offsets[file_idx]
+        row_group_idx = bisect_right(row_group_offsets, local_idx)
+        row_group_start = 0 if row_group_idx == 0 else row_group_offsets[row_group_idx - 1]
+        row_idx = local_idx - row_group_start
+
+        return file_idx, row_group_idx, row_idx
+
+    def _decode_image(self, value) -> Image.Image:
+        if isinstance(value, Image.Image):
+            return value.convert("RGB")
+        if isinstance(value, dict):
+            if "bytes" in value and value["bytes"] is not None:
+                return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
+            if "path" in value and value["path"]:
+                return Image.open(value["path"]).convert("RGB")
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return Image.open(io.BytesIO(bytes(value))).convert("RGB")
+        if hasattr(value, "to_pylist"):
+            value = value.to_pylist()
+        if hasattr(value, "tolist"):
+            import numpy as np
+            arr = np.asarray(value)
+            return Image.fromarray(arr).convert("RGB")
+        raise TypeError(f"Unsupported image type: {type(value)}")
+
+    def __getitem__(self, idx: int):
+        file_idx, row_group_idx, row_idx = self._resolve_index(idx)
+        cols = self._load_row_group(file_idx, row_group_idx)
+
+        if self.image_key not in cols:
+            raise KeyError(f"Missing image column '{self.image_key}'")
+        if self.label_key not in cols:
+            raise KeyError(f"Missing label column '{self.label_key}'")
+
+        image = self._decode_image(cols[self.image_key][row_idx])
+        label = cols[self.label_key][row_idx]
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        if isinstance(label, torch.Tensor):
+            label = label.item()
+        return image, int(label)
