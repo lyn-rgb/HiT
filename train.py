@@ -35,6 +35,7 @@ from data_utils import ParquetImageDataset
 import wandb_utils
 from log_utils import TrainingLogger
 from snapshot_utils import snapshot_code
+import tb_utils
 
 warnings.filterwarnings("ignore")
 
@@ -138,8 +139,10 @@ def main(args):
         project = os.environ["PROJECT"]
         if args.wandb:
             wandb_utils.initialize(args, entity, experiment_name, project)
+        tb_writer = tb_utils.setup(f"{experiment_dir}/tensorboard", enabled=args.tensorboard)
     else:
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
+        tb_writer = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -294,6 +297,11 @@ def main(args):
                         { "train loss": avg_loss, "train steps/sec": steps_per_sec },
                         step=train_steps
                     )
+                tb_utils.log(
+                    tb_writer,
+                    { "train/loss": avg_loss, "train/steps_per_sec": steps_per_sec },
+                    train_steps,
+                )
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -334,6 +342,7 @@ def main(args):
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    tb_utils.close(tb_writer)
     cleanup()
 
 
@@ -364,6 +373,8 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--tensorboard", action="store_true",
+                        help="Enable TensorBoard logging (rank 0 only)")
     parser.add_argument("--log-all-ranks", action="store_true",
                         help="Log to stdout from all ranks (file logging stays rank 0 only)")
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
