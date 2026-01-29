@@ -43,7 +43,7 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
 
-        if x.is_cuda:
+        if x.is_cuda and q.size(-1) <= 256:
             dropout_p = self.attn_drop.p if self.training else 0.0
             dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
             attn = attention(

@@ -2,10 +2,13 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-A minimal training script for the VAE using PyTorch DDP.
+Train a hierarchical VAE in a stage-wise manner.
 """
 import torch
 import warnings
+
+warnings.filterwarnings("ignore")
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
@@ -22,14 +25,13 @@ from time import time
 import argparse
 import logging
 import os
+import json
 
-from vae import AutoencoderKL
+from vae import AutoencoderKL, HierarchicalVAE
 import wandb_utils
 from log_utils import TrainingLogger
 from snapshot_utils import snapshot_code
 import tb_utils
-
-warnings.filterwarnings("ignore")
 from data_utils import ParquetImageDataset
 
 
@@ -45,7 +47,7 @@ def cleanup():
 
 
 def create_logger(logging_dir, rank, log_all_ranks=False):
-    return TrainingLogger(logging_dir, rank=rank, name="vae", log_all_ranks=log_all_ranks)
+    return TrainingLogger(logging_dir, rank=rank, name="hvae", log_all_ranks=log_all_ranks)
 
 
 def center_crop_arr(pil_image, image_size):
@@ -69,22 +71,66 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+def set_requires_grad(module, flag):
+    for param in module.parameters():
+        param.requires_grad = flag
+
+
+def parse_csv_floats(value, name):
+    if value is None:
+        return None
+    parts = [v.strip() for v in value.split(",") if v.strip()]
+    if not parts:
+        return None
+    try:
+        return [float(v) for v in parts]
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name} list: {value}") from exc
+
+
+def load_json_arg(value, name):
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if os.path.isfile(value):
+        with open(value, "r", encoding="utf-8") as f:
+            return json.load(f)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a JSON string or a path to a JSON file.") from exc
+
+
+def compute_mu_for_level(hvae, x, level):
+    posterior = hvae.base_vae.encode(x).latent_dist
+    mu = posterior.mean
+    for i in range(level - 1):
+        sub_posterior = hvae.sub_vaes[i].encode(mu).latent_dist
+        mu = sub_posterior.mean
+    return mu
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
     """
-    Trains the VAE model.
+    Trains the hierarchical VAE model stage-by-stage.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    assert args.train_level >= 0, "train_level must be >= 0."
+    assert args.num_levels >= 1, "num_levels must be >= 1."
+    assert args.train_level < args.num_levels, "train_level must be < num_levels."
 
     # Setup DDP:
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, "Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank·
+    seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
@@ -94,7 +140,7 @@ def main(args):
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        experiment_name = f"{experiment_index:03d}-vae"
+        experiment_name = f"{experiment_index:03d}-hvae-l{args.train_level}"
         experiment_dir = f"{args.results_dir}/{experiment_name}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -117,16 +163,47 @@ def main(args):
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     vae_path = args.vae_path or f"stabilityai/sd-vae-ft-{args.vae}"
-    vae = AutoencoderKL.from_pretrained(vae_path)
+    base_vae = AutoencoderKL.from_pretrained(vae_path)
+    sub_vae_configs = load_json_arg(args.sub_vae_configs, "sub_vae_configs")
+    hvae = HierarchicalVAE(base_vae=base_vae, num_levels=args.num_levels, sub_vae_configs=sub_vae_configs)
     if args.ckpt is not None:
         state = torch.load(args.ckpt, map_location="cpu")
-        vae.load_state_dict(state["model"])
-    vae = DDP(vae.to(device), device_ids=[device])
-    vae.train()
-    logger.info(f"VAE Parameters: {sum(p.numel() for p in vae.parameters()):,}")
+        hvae.load_state_dict(state["model"])
+    hvae = DDP(hvae.to(device), device_ids=[device])
+    hvae.train()
+
+    # Freeze non-target levels:
+    target_level = args.train_level
+    set_requires_grad(hvae.module.base_vae, target_level == 0)
+    if target_level != 0:
+        hvae.module.base_vae.eval()
+    for i, sub_vae in enumerate(hvae.module.sub_vaes):
+        is_target = i == (target_level - 1)
+        set_requires_grad(sub_vae, is_target)
+        if not is_target:
+            sub_vae.eval()
+
+    train_params = [p for p in hvae.parameters() if p.requires_grad]
+    logger.info(f"Trainable parameters: {sum(p.numel() for p in train_params):,}")
 
     # Setup optimizer:
-    opt = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0)
+    level_lrs = parse_csv_floats(args.level_lrs, "level_lrs")
+    level_recon_weights = parse_csv_floats(args.level_recon_weights, "level_recon_weights")
+    level_kl_weights = parse_csv_floats(args.level_kl_weights, "level_kl_weights")
+    if level_lrs is not None and len(level_lrs) != args.num_levels:
+        raise ValueError("level_lrs must have exactly num_levels entries.")
+    if level_recon_weights is not None and len(level_recon_weights) != args.num_levels:
+        raise ValueError("level_recon_weights must have exactly num_levels entries.")
+    if level_kl_weights is not None and len(level_kl_weights) != args.num_levels:
+        raise ValueError("level_kl_weights must have exactly num_levels entries.")
+
+    lr = level_lrs[target_level] if level_lrs is not None else args.lr
+    recon_weight = (
+        level_recon_weights[target_level] if level_recon_weights is not None else 1.0
+    )
+    kl_weight = level_kl_weights[target_level] if level_kl_weights is not None else args.kl_weight
+
+    opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
@@ -176,19 +253,30 @@ def main(args):
     running_kl = 0.0
     start_time = time()
 
-    logger.info(f"Training for {args.epochs} epochs...")
+    logger.info(f"Training for {args.epochs} epochs... (level {args.train_level})")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, _ in loader:
             x = x.to(device)
             with amp_autocast(dtype=autocast_dtype):
-                posterior = vae.module.encode(x).latent_dist
-                z = posterior.sample()
-                recon = vae.module.decode(z).sample
-                recon_loss = torch.mean((recon - x) ** 2)
-                kl_loss = posterior.kl().mean()
-                loss = recon_loss + args.kl_weight * kl_loss
+                if target_level == 0:
+                    posterior = hvae.module.base_vae.encode(x).latent_dist
+                    z = posterior.sample()
+                    recon = hvae.module.base_vae.decode(z).sample
+                    recon_loss = torch.mean((recon - x) ** 2)
+                    kl_loss = posterior.kl().mean()
+                else:
+                    with torch.no_grad():
+                        mu = compute_mu_for_level(hvae.module, x, target_level)
+                    sub_vae = hvae.module.sub_vaes[target_level - 1]
+                    posterior = sub_vae.encode(mu).latent_dist
+                    z = posterior.sample()
+                    recon = sub_vae.decode(z).sample
+                    recon_loss = torch.mean((recon - mu) ** 2)
+                    kl_loss = posterior.kl().mean()
+
+                loss = recon_weight * recon_loss + kl_weight * kl_loss
 
             opt.zero_grad()
             if scaler.is_enabled():
@@ -256,17 +344,18 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": vae.module.state_dict(),
+                        "model": hvae.module.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
-                        "train_steps": train_steps
+                        "train_steps": train_steps,
+                        "train_level": args.train_level,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
-    vae.eval()
+    hvae.eval()
     logger.info("Done!")
     tb_utils.close(tb_writer)
     cleanup()
@@ -287,6 +376,11 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--vae-path", type=str, default=None,
                         help="Optional local path to a diffusers-format VAE folder")
+    parser.add_argument("--num-levels", type=int, default=2)
+    parser.add_argument("--train-level", type=int, default=0,
+                        help="Which level to train: 0=base_vae, 1..=sub_vae")
+    parser.add_argument("--sub-vae-configs", type=str, default=None,
+                        help="JSON string or path to JSON file with per-sub-vae configs")
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
@@ -295,6 +389,12 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--kl-weight", type=float, default=1e-6)
+    parser.add_argument("--level-lrs", type=str, default=None,
+                        help="Comma-separated learning rates per level (length=num_levels)")
+    parser.add_argument("--level-recon-weights", type=str, default=None,
+                        help="Comma-separated recon loss weights per level (length=num_levels)")
+    parser.add_argument("--level-kl-weights", type=str, default=None,
+                        help="Comma-separated KL loss weights per level (length=num_levels)")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--tensorboard", action="store_true",
                         help="Enable TensorBoard logging (rank 0 only)")
@@ -305,7 +405,7 @@ if __name__ == "__main__":
     parser.add_argument("--run-notes", type=str, default="",
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a VAE checkpoint to resume from")
+                        help="Optional path to a hierarchical VAE checkpoint to resume from")
 
     args = parser.parse_args()
     main(args)

@@ -250,7 +250,7 @@ class Attention(nn.Module):
         k = k.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
         v = v.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
 
-        if hidden_states.is_cuda:
+        if hidden_states.is_cuda and q.size(-1) <= 256:
             dropout_p = self.to_out[1].p if self.training else 0.0
             dtype = hidden_states.dtype if hidden_states.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
             attn = attention(
@@ -689,6 +689,101 @@ class AutoencoderKL(nn.Module):
             state_dict = state_dict["state_dict"]
         model.load_state_dict(state_dict, strict=True)
         return model
+
+
+@dataclass
+class HierarchicalVAEOutput:
+    recon: torch.Tensor
+    posterior: DiagonalGaussianDistribution
+    mu: torch.Tensor
+    sub_posteriors: Tuple[DiagonalGaussianDistribution, ...]
+    sub_mus: Tuple[torch.Tensor, ...]
+    sub_recons: Tuple[torch.Tensor, ...]
+
+
+class HierarchicalVAE(nn.Module):
+    def __init__(
+        self,
+        base_vae: AutoencoderKL,
+        num_levels: int = 2,
+        sub_vae_configs: Optional[Tuple[dict, ...]] = None,
+    ):
+        super().__init__()
+        if num_levels < 1:
+            raise ValueError(f"num_levels must be >= 1, got {num_levels}")
+        if sub_vae_configs is not None and len(sub_vae_configs) != num_levels - 1:
+            raise ValueError("sub_vae_configs must have num_levels - 1 entries when provided.")
+
+        self.base_vae = base_vae
+        self.sub_vaes = nn.ModuleList()
+        self.num_levels = num_levels
+
+        prev_channels = base_vae.config["latent_channels"]
+        for i in range(num_levels - 1):
+            if sub_vae_configs is None:
+                sub_config = self._default_sub_vae_config(base_vae.config, prev_channels)
+            else:
+                sub_config = dict(sub_vae_configs[i])
+                sub_config.setdefault("in_channels", prev_channels)
+                sub_config.setdefault("out_channels", prev_channels)
+                sub_config.setdefault("latent_channels", prev_channels)
+            sub_vae = AutoencoderKL(**sub_config)
+            self.sub_vaes.append(sub_vae)
+            prev_channels = sub_vae.config["latent_channels"]
+
+        self.config = {
+            "num_levels": num_levels,
+            "base_config": dict(base_vae.config),
+            "sub_vae_configs": [dict(m.config) for m in self.sub_vaes],
+        }
+
+    @staticmethod
+    def _default_sub_vae_config(base_config: dict, in_channels: int) -> dict:
+        # Shallow VAE to avoid excessive downsampling on latent feature maps.
+        return {
+            "in_channels": in_channels,
+            "out_channels": in_channels,
+            "down_block_types": ("DownEncoderBlock2D",),
+            "up_block_types": ("UpDecoderBlock2D",),
+            "block_out_channels": (base_config["block_out_channels"][0],),
+            "layers_per_block": base_config["layers_per_block"],
+            "act_fn": base_config["act_fn"],
+            "latent_channels": in_channels,
+            "norm_num_groups": base_config["norm_num_groups"],
+            "sample_size": max(1, int(base_config.get("sample_size", 32) // 8)),
+            "scaling_factor": base_config["scaling_factor"],
+            "mid_block_add_attention": base_config["mid_block_add_attention"],
+            "use_quant_conv": base_config["use_quant_conv"],
+            "use_post_quant_conv": base_config["use_post_quant_conv"],
+        }
+
+    def forward(self, sample: torch.Tensor) -> HierarchicalVAEOutput:
+        posterior = self.base_vae.encode(sample).latent_dist
+        mu = posterior.mean
+        z = posterior.sample()
+        recon = self.base_vae.decode(z).sample
+
+        sub_posteriors = []
+        sub_mus = []
+        sub_recons = []
+        input_mu = mu
+        for sub_vae in self.sub_vaes:
+            sub_posterior = sub_vae.encode(input_mu).latent_dist
+            sub_posteriors.append(sub_posterior)
+            sub_mus.append(sub_posterior.mean)
+            sub_z = sub_posterior.sample()
+            sub_recon = sub_vae.decode(sub_z).sample
+            sub_recons.append(sub_recon)
+            input_mu = sub_posterior.mean
+
+        return HierarchicalVAEOutput(
+            recon=recon,
+            posterior=posterior,
+            mu=mu,
+            sub_posteriors=tuple(sub_posteriors),
+            sub_mus=tuple(sub_mus),
+            sub_recons=tuple(sub_recons),
+        )
 
 
 def _resolve_pretrained_path(pretrained_path: str) -> str:

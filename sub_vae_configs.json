@@ -1,0 +1,32 @@
+[
+  {
+    "in_channels": 4,
+    "out_channels": 4,
+    "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D"],
+    "block_out_channels": [64, 64],
+    "layers_per_block": 1,
+    "act_fn": "silu",
+    "latent_channels": 8,
+    "norm_num_groups": 32,
+    "sample_size": 2,
+    "mid_block_add_attention": true,
+    "use_quant_conv": true,
+    "use_post_quant_conv": true
+  },
+  {
+    "in_channels": 8,
+    "out_channels": 8,
+    "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D"],
+    "block_out_channels": [64, 64],
+    "layers_per_block": 1,
+    "act_fn": "silu",
+    "latent_channels": 16,
+    "norm_num_groups": 32,
+    "sample_size": 2,
+    "mid_block_add_attention": true,
+    "use_quant_conv": true,
+    "use_post_quant_conv": true
+  }
+]

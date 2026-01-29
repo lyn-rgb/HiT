@@ -124,6 +124,87 @@ torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-L/2 --data-path /pat
 
 **Caution.** Resuming training will automatically restore both model, EMA, and optimizer states and training configs to be the same as in the checkpoint.
 
+## Training Hierarchical VAE
+
+We provide a stage-wise training script for the hierarchical VAE in [`train_hvae.py`](train_hvae.py). Training is done one VAE at a time:
+
+```bash
+# 1) Train base VAE (level 0)
+torchrun --nnodes=1 --nproc_per_node=N train_hvae.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 0
+
+# 2) Train level-1 VAE (loads the base from the previous checkpoint)
+torchrun --nnodes=1 --nproc_per_node=N train_hvae.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 1 \
+  --ckpt /path/to/level0_checkpoint.pt
+```
+
+**Per-level learning rate and loss weights.** Provide comma-separated lists with length `num_levels`:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N train_hvae.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 2 \
+  --level-lrs 1e-4,5e-5,2e-5 \
+  --level-recon-weights 1.0,1.0,1.0 \
+  --level-kl-weights 1e-6,1e-6,5e-6
+```
+
+**Custom sub-VAE configs.** You can override each sub-VAE config by passing a JSON string or JSON file path via `--sub-vae-configs`.
+The list length must be `num_levels - 1` (one entry per sub-VAE).
+
+```bash
+cat <<'EOF' > sub_vae_configs.json
+[
+  {
+    "in_channels": 4,
+    "out_channels": 4,
+    "down_block_types": ["DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D"],
+    "block_out_channels": [64],
+    "layers_per_block": 1,
+    "act_fn": "silu",
+    "latent_channels": 4,
+    "norm_num_groups": 32,
+    "sample_size": 4,
+    "mid_block_add_attention": true,
+    "use_quant_conv": true,
+    "use_post_quant_conv": true
+  },
+  {
+    "in_channels": 4,
+    "out_channels": 4,
+    "down_block_types": ["DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D"],
+    "block_out_channels": [64],
+    "layers_per_block": 1,
+    "act_fn": "silu",
+    "latent_channels": 4,
+    "norm_num_groups": 32,
+    "sample_size": 4,
+    "mid_block_add_attention": true,
+    "use_quant_conv": true,
+    "use_post_quant_conv": true
+  }
+]
+EOF
+
+torchrun --nnodes=1 --nproc_per_node=N train_hvae.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 1 \
+  --sub-vae-configs sub_vae_configs.json
+```
+
 ## Evaluation (FID, Inception Score, etc.)
 
 We include a [`sample_ddp.py`](sample_ddp.py) script which samples a large number of images from a SiT model in parallel. This script 
@@ -165,5 +246,4 @@ versus 2.06 in the paper).
 
 ## License
 This project is under the MIT license. See [LICENSE](LICENSE.txt) for details.
-
 
