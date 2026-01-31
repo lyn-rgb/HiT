@@ -88,7 +88,6 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(vae_path).to(device)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
     if args.amp_dtype == "bf16":
         vae = vae.to(dtype=torch.bfloat16)
     vae.eval()
@@ -99,7 +98,12 @@ def main(args):
     with torch.no_grad():
         for batch_idx, (images, labels, paths) in enumerate(loader):
             images = images.to(device)
-            with amp_autocast(dtype=autocast_dtype):
+            if use_amp:
+                with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                    posterior = vae.encode(images).latent_dist
+                    mu = posterior.mean.detach().cpu()
+                    logvar = posterior.logvar.detach().cpu()
+            else:
                 posterior = vae.encode(images).latent_dist
                 mu = posterior.mean.detach().cpu()
                 logvar = posterior.logvar.detach().cpu()
