@@ -20,15 +20,23 @@ else:
     _PARQUET_IMPORT_ERROR = None
 
 
-def _resolve_parquet_files(path: str) -> List[str]:
+def _resolve_parquet_files(path: str, subset: Optional[str] = None) -> List[str]:
     if os.path.isdir(path):
         files = sorted(glob(os.path.join(path, "*.parquet")))
     else:
         files = sorted(glob(path))
         if not files and os.path.isfile(path) and path.endswith(".parquet"):
             files = [path]
+    if subset is not None:
+        subset = subset.lower()
+        files = [
+            f for f in files
+            if os.path.basename(f).lower().startswith(f"{subset}")
+        ]
     if not files:
-        raise FileNotFoundError(f"No parquet files found at {path}")
+        if subset is None:
+            raise FileNotFoundError(f"No parquet files found at {path}")
+        raise FileNotFoundError(f"No parquet files found at {path} for subset '{subset}'")
     return files
 
 
@@ -39,6 +47,7 @@ class ParquetImageDataset(Dataset):
         transform=None,
         image_key: str = "image",
         label_key: str = "label",
+        subset: Optional[str] = None,
         use_threads: bool = True,
         memory_map: bool = False,
         pre_buffer: bool = False,
@@ -47,7 +56,13 @@ class ParquetImageDataset(Dataset):
         if _PARQUET_IMPORT_ERROR is not None:
             raise ModuleNotFoundError("pyarrow is required for parquet datasets") from _PARQUET_IMPORT_ERROR
 
-        self.files = _resolve_parquet_files(path)
+        if subset is not None:
+            subset = subset.lower()
+            if subset not in {"train", "test", "validation", "val"}:
+                raise ValueError(f"subset must be one of train, test, validation, val; got {subset}")
+            if subset == "val":
+                subset = "validation"
+        self.files = _resolve_parquet_files(path, subset=subset)
         self.transform = transform
         self.image_key = image_key
         self.label_key = label_key
