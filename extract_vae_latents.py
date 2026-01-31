@@ -18,6 +18,23 @@ from PIL import Image
 from vae import AutoencoderKL
 
 
+def _writer_loop(q):
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        out_path, mu_item, logvar_item = item
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        torch.save({"mu": mu_item, "logvar": logvar_item}, out_path)
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def center_crop_arr(pil_image, image_size):
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
@@ -105,18 +122,9 @@ def main(args):
     ctx = mp.get_context("spawn")
     queue = ctx.Queue(maxsize=args.queue_size)
 
-    def writer_loop(q):
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            out_path, mu_item, logvar_item = item
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            torch.save({"mu": mu_item, "logvar": logvar_item}, out_path)
-
     writers = []
     for _ in range(max(1, args.num_writers)):
-        writer = ctx.Process(target=writer_loop, args=(queue,))
+        writer = ctx.Process(target=_writer_loop, args=(queue,))
         writer.daemon = True
         writer.start()
         writers.append(writer)
@@ -148,14 +156,17 @@ def main(args):
             if rank == 0 and (batch_idx + 1) % log_every == 0:
                 elapsed = time() - start_time if start_time is not None else 0.0
                 imgs_per_sec = processed / elapsed if elapsed > 0 else 0.0
+                total = len(dataset)
+                remaining = max(0, total - processed)
+                eta = _format_eta(remaining / imgs_per_sec if imgs_per_sec > 0 else 0.0)
                 print(
                     f"Processed {batch_idx + 1} batches "
-                    f"({processed} images), {imgs_per_sec:.2f} img/s",
+                    f"({processed} images), {imgs_per_sec:.2f} img/s, ETA {eta}",
                     flush=True,
                 )
 
     for _ in writers:
-    queue.put(None)
+        queue.put(None)
     for writer in writers:
         writer.join()
     dist.barrier()
