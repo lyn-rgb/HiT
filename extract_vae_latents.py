@@ -4,6 +4,8 @@
 
 import argparse
 import os
+import multiprocessing as mp
+from time import time
 
 import torch
 import torch.distributed as dist
@@ -13,8 +15,6 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
 from PIL import Image
-from contextlib import nullcontext
-
 from vae import AutoencoderKL
 
 
@@ -52,6 +52,10 @@ def parse_args():
                         choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--num-writers", type=int, default=1,
+                        help="Number of writer processes for async disk I/O.")
+    parser.add_argument("--queue-size", type=int, default=256,
+                        help="Max queued write items before producers block.")
     return parser.parse_args()
 
 
@@ -94,7 +98,31 @@ def main(args):
 
     if rank == 0:
         os.makedirs(args.output, exist_ok=True)
+        start_time = time()
+    else:
+        start_time = None
 
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue(maxsize=args.queue_size)
+
+    def writer_loop(q):
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            out_path, mu_item, logvar_item = item
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            torch.save({"mu": mu_item, "logvar": logvar_item}, out_path)
+
+    writers = []
+    for _ in range(max(1, args.num_writers)):
+        writer = ctx.Process(target=writer_loop, args=(queue,))
+        writer.daemon = True
+        writer.start()
+        writers.append(writer)
+
+    log_every = 100
+    processed = 0
     with torch.no_grad():
         for batch_idx, (images, labels, paths) in enumerate(loader):
             images = images.to(device)
@@ -113,16 +141,27 @@ def main(args):
                 class_name = dataset.classes[label]
                 rel_name = os.path.splitext(os.path.basename(paths[i]))[0] + ".pt"
                 class_dir = os.path.join(args.output, class_name)
-                os.makedirs(class_dir, exist_ok=True)
                 out_path = os.path.join(class_dir, rel_name)
-                torch.save({"mu": mu[i], "logvar": logvar[i]}, out_path)
+                queue.put((out_path, mu[i], logvar[i]))
 
-            if rank == 0 and (batch_idx + 1) % 100 == 0:
-                print(f"Processed {batch_idx + 1} batches", flush=True)
+            processed += mu.shape[0]
+            if rank == 0 and (batch_idx + 1) % log_every == 0:
+                elapsed = time() - start_time if start_time is not None else 0.0
+                imgs_per_sec = processed / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"Processed {batch_idx + 1} batches "
+                    f"({processed} images), {imgs_per_sec:.2f} img/s",
+                    flush=True,
+                )
 
+    for _ in writers:
+    queue.put(None)
+    for writer in writers:
+        writer.join()
     dist.barrier()
     if rank == 0:
-        print("Done.", flush=True)
+        elapsed = time() - start_time if start_time is not None else 0.0
+        print(f"Done. Elapsed {elapsed:.2f} seconds.", flush=True)
     dist.destroy_process_group()
 
 
