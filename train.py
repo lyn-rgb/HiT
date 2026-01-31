@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from torchvision.utils import save_image
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -25,6 +26,7 @@ from time import time
 import argparse
 import logging
 import os
+import math
 
 from models import SiT_models
 from download import find_model
@@ -74,6 +76,12 @@ def cleanup():
 
 def create_logger(logging_dir, rank, log_all_ranks=False):
     return TrainingLogger(logging_dir, rank=rank, name="sit", log_all_ranks=log_all_ranks)
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def center_crop_arr(pil_image, image_size):
@@ -143,6 +151,7 @@ def main(args):
     else:
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
         tb_writer = None
+        experiment_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -234,7 +243,9 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    total_steps = args.epochs * len(loader)
     start_time = time()
+    train_start_time = start_time
 
     # Labels to condition the model with (feel free to change):
     ys = torch.randint(1000, size=(local_batch_size,), device=device)
@@ -276,7 +287,7 @@ def main(args):
             else:
                 loss.backward()
                 opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model.module, decay=args.ema_decay)
 
             # Log loss values:
             running_loss += loss.item()
@@ -287,11 +298,19 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
+                elapsed = end_time - train_start_time
+                avg_steps_per_sec = train_steps / elapsed if elapsed > 0 else 0.0
+                remaining_steps = max(0, total_steps - train_steps)
+                eta_seconds = remaining_steps / avg_steps_per_sec if avg_steps_per_sec > 0 else 0.0
+                eta_str = _format_eta(eta_seconds)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, "
+                    f"Train Steps/Sec: {steps_per_sec:.2f}, ETA: {eta_str}"
+                )
                 if args.wandb:
                     wandb_utils.log(
                         { "train loss": avg_loss, "train steps/sec": steps_per_sec },
@@ -336,6 +355,19 @@ def main(args):
 
                 if args.wandb:
                     wandb_utils.log_image(out_samples, train_steps)
+                if rank == 0:
+                    out_samples_cpu = out_samples.detach().cpu()
+                    sample_dir = os.path.join(experiment_dir, "samples", f"{train_steps:07d}")
+                    os.makedirs(sample_dir, exist_ok=True)
+                    for idx, img in enumerate(out_samples_cpu):
+                        img_path = os.path.join(sample_dir, f"{idx:04d}.png")
+                        save_image(
+                            img,
+                            img_path,
+                            normalize=True,
+                            value_range=(-1, 1),
+                        )
+                    logger.info(f"Saved EMA samples to {sample_dir}")
                 logger.info("Generating EMA samples done.")
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -367,9 +399,10 @@ if __name__ == "__main__":
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")

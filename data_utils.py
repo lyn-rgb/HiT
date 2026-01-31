@@ -39,6 +39,10 @@ class ParquetImageDataset(Dataset):
         transform=None,
         image_key: str = "image",
         label_key: str = "label",
+        use_threads: bool = True,
+        memory_map: bool = False,
+        pre_buffer: bool = False,
+        buffer_size: int = 0,
     ):
         if _PARQUET_IMPORT_ERROR is not None:
             raise ModuleNotFoundError("pyarrow is required for parquet datasets") from _PARQUET_IMPORT_ERROR
@@ -47,13 +51,22 @@ class ParquetImageDataset(Dataset):
         self.transform = transform
         self.image_key = image_key
         self.label_key = label_key
+        self.use_threads = use_threads
+        self.memory_map = memory_map
+        self.pre_buffer = pre_buffer
+        self.buffer_size = buffer_size
 
         self._file_row_group_counts: List[List[int]] = []
         self._file_row_group_offsets: List[List[int]] = []
         self._file_total_rows: List[int] = []
 
         for file_path in self.files:
-            pf = pq.ParquetFile(file_path)
+            pf = pq.ParquetFile(
+                file_path,
+                memory_map=self.memory_map,
+                pre_buffer=self.pre_buffer,
+                buffer_size=self.buffer_size,
+            )
             row_group_counts = [pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups)]
             offsets = []
             running = 0
@@ -73,6 +86,16 @@ class ParquetImageDataset(Dataset):
         self._cache_file_idx: Optional[int] = None
         self._cache_row_group_idx: Optional[int] = None
         self._cache_cols: Optional[dict] = None
+        self._parquet_file_cache: dict = {}
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Drop file handles and cached columns to keep the dataset picklable.
+        state["_parquet_file_cache"] = {}
+        state["_cache_file_idx"] = None
+        state["_cache_row_group_idx"] = None
+        state["_cache_cols"] = None
+        return state
 
     def __len__(self) -> int:
         return self._cum_file_rows[-1] if self._cum_file_rows else 0
@@ -85,8 +108,20 @@ class ParquetImageDataset(Dataset):
         ):
             return self._cache_cols
 
-        pf = pq.ParquetFile(self.files[file_idx])
-        table = pf.read_row_group(row_group_idx, columns=[self.image_key, self.label_key])
+        pf = self._parquet_file_cache.get(file_idx)
+        if pf is None:
+            pf = pq.ParquetFile(
+                self.files[file_idx],
+                memory_map=self.memory_map,
+                pre_buffer=self.pre_buffer,
+                buffer_size=self.buffer_size,
+            )
+            self._parquet_file_cache[file_idx] = pf
+        table = pf.read_row_group(
+            row_group_idx,
+            columns=[self.image_key, self.label_key],
+            use_threads=self.use_threads,
+        )
         cols = table.to_pydict()
         self._cache_file_idx = file_idx
         self._cache_row_group_idx = row_group_idx

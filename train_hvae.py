@@ -17,8 +17,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from torchvision.utils import save_image
 import numpy as np
 from PIL import Image
+from collections import OrderedDict
+from copy import deepcopy
 from glob import glob
 from contextlib import nullcontext
 from time import time
@@ -48,6 +51,23 @@ def cleanup():
 
 def create_logger(logging_dir, rank, log_all_ranks=False):
     return TrainingLogger(logging_dir, rank=rank, name="hvae", log_all_ranks=log_all_ranks)
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def center_crop_arr(pil_image, image_size):
@@ -159,6 +179,7 @@ def main(args):
     else:
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
         tb_writer = None
+        experiment_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -169,7 +190,15 @@ def main(args):
     if args.ckpt is not None:
         state = torch.load(args.ckpt, map_location="cpu")
         hvae.load_state_dict(state["model"])
-    hvae = DDP(hvae.to(device), device_ids=[device])
+    hvae = hvae.to(device)
+    ema = deepcopy(hvae).to(device)
+    for p in ema.parameters():
+        p.requires_grad = False
+    update_ema(ema, hvae, decay=0)
+    ema.eval()
+    if args.ckpt is not None and "ema" in state:
+        ema.load_state_dict(state["ema"])
+    hvae = DDP(hvae, device_ids=[device])
     hvae.train()
 
     # Freeze non-target levels:
@@ -251,7 +280,9 @@ def main(args):
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
+    total_steps = args.epochs * len(loader)
     start_time = time()
+    train_start_time = start_time
 
     logger.info(f"Training for {args.epochs} epochs... (level {args.train_level})")
     for epoch in range(args.epochs):
@@ -286,6 +317,7 @@ def main(args):
             else:
                 loss.backward()
                 opt.step()
+            update_ema(ema, hvae.module, decay=args.ema_decay)
 
             # Log loss values:
             running_loss += loss.item()
@@ -297,6 +329,11 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
+                elapsed = end_time - train_start_time
+                avg_steps_per_sec = train_steps / elapsed if elapsed > 0 else 0.0
+                remaining_steps = max(0, total_steps - train_steps)
+                eta_seconds = remaining_steps / avg_steps_per_sec if avg_steps_per_sec > 0 else 0.0
+                eta_str = _format_eta(eta_seconds)
 
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_recon = torch.tensor(running_recon / log_steps, device=device)
@@ -312,7 +349,7 @@ def main(args):
                 logger.info(
                     f"(step={train_steps:07d}) "
                     f"Loss: {avg_loss:.6f}, Recon: {avg_recon:.6f}, KL: {avg_kl:.6f}, "
-                    f"Steps/Sec: {steps_per_sec:.2f}"
+                    f"Steps/Sec: {steps_per_sec:.2f}, ETA: {eta_str}"
                 )
                 if args.wandb:
                     wandb_utils.log(
@@ -340,11 +377,44 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
+            if train_steps % args.sample_every == 0 and train_steps > 0:
+                if rank == 0:
+                    recon_dir = os.path.join(experiment_dir, "recon", f"{train_steps:07d}")
+                    os.makedirs(recon_dir, exist_ok=True)
+                    if target_level == 0:
+                        x_cpu = x.detach().cpu()
+                        recon_cpu = recon.detach().cpu()
+                        for idx in range(x_cpu.shape[0]):
+                            save_image(
+                                x_cpu[idx],
+                                os.path.join(recon_dir, f"input_{idx:04d}.png"),
+                                normalize=True,
+                                value_range=(-1, 1),
+                            )
+                            save_image(
+                                recon_cpu[idx],
+                                os.path.join(recon_dir, f"recon_{idx:04d}.png"),
+                                normalize=True,
+                                value_range=(-1, 1),
+                            )
+                    else:
+                        torch.save(
+                            {
+                                "mu": mu.detach().cpu(),
+                                "recon": recon.detach().cpu(),
+                                "train_level": target_level,
+                                "step": train_steps,
+                            },
+                            os.path.join(recon_dir, "recon.pt"),
+                        )
+                    logger.info(f"Saved reconstructions to {recon_dir}")
+
             # Save VAE checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
                         "model": hvae.module.state_dict(),
+                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
                         "train_steps": train_steps,
@@ -384,9 +454,11 @@ if __name__ == "__main__":
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--sample-every", type=int, default=50_000)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--kl-weight", type=float, default=1e-6)
     parser.add_argument("--level-lrs", type=str, default=None,
