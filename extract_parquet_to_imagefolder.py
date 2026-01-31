@@ -4,8 +4,37 @@
 
 import argparse
 import os
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 from data_utils import ParquetImageDataset
+
+
+_WORKER_DATASET = None
+_WORKER_OUTPUT_ROOT = None
+_WORKER_NUM_DIGITS = None
+
+
+def _init_worker(input_path, image_key, label_key, subset, output_root, num_digits):
+    global _WORKER_DATASET, _WORKER_OUTPUT_ROOT, _WORKER_NUM_DIGITS
+    _WORKER_DATASET = ParquetImageDataset(
+        input_path,
+        transform=None,
+        image_key=image_key,
+        label_key=label_key,
+        subset=subset,
+    )
+    _WORKER_OUTPUT_ROOT = output_root
+    _WORKER_NUM_DIGITS = num_digits
+
+
+def _process_index(idx):
+    image, label = _WORKER_DATASET[idx]
+    class_dir = os.path.join(_WORKER_OUTPUT_ROOT, str(label))
+    os.makedirs(class_dir, exist_ok=True)
+    filename = f"{idx:0{_WORKER_NUM_DIGITS}d}.png"
+    image.save(os.path.join(class_dir, filename))
+    return idx
 
 
 def parse_args():
@@ -22,6 +51,8 @@ def parse_args():
     parser.add_argument("--label-key", type=str, default="label")
     parser.add_argument("--all", action="store_true",
                         help="Extract train/val/test splits into subdirectories.")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Number of worker processes for extraction.")
     parser.add_argument("--start-idx", type=int, default=0,
                         help="Optional starting index for naming output files.")
     parser.add_argument("--limit", type=int, default=None,
@@ -62,14 +93,31 @@ def main():
         end = min(total, start + limit)
 
         num_digits = max(6, len(str(end)))
-        for idx in range(start, end):
-            image, label = dataset[idx]
-            class_dir = os.path.join(output_root, str(label))
-            os.makedirs(class_dir, exist_ok=True)
-            filename = f"{idx:0{num_digits}d}.png"
-            image.save(os.path.join(class_dir, filename))
-            if (idx + 1) % 1000 == 0 or idx + 1 == end:
-                print(f"[{subset_dir or subset or 'all'}] Saved {idx + 1 - start}/{end - start} images", flush=True)
+        indices = list(range(start, end))
+        tag = subset_dir or subset or "all"
+
+        if args.num_workers and args.num_workers > 1:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=args.num_workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(args.input, args.image_key, args.label_key, subset, output_root, num_digits),
+            ) as executor:
+                done = 0
+                for _ in executor.map(_process_index, indices, chunksize=16):
+                    done += 1
+                    if done % 1000 == 0 or done == len(indices):
+                        print(f"[{tag}] Saved {done}/{len(indices)} images", flush=True)
+        else:
+            for idx in indices:
+                image, label = dataset[idx]
+                class_dir = os.path.join(output_root, str(label))
+                os.makedirs(class_dir, exist_ok=True)
+                filename = f"{idx:0{num_digits}d}.png"
+                image.save(os.path.join(class_dir, filename))
+                if (idx + 1 - start) % 1000 == 0 or idx + 1 == end:
+                    print(f"[{tag}] Saved {idx + 1 - start}/{end - start} images", flush=True)
 
 
 if __name__ == "__main__":
