@@ -687,6 +687,7 @@ class AutoencoderKL(nn.Module):
         state_dict = _load_state_dict(weights_path)
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
+        state_dict = _remap_attn_keys(state_dict)
         model.load_state_dict(state_dict, strict=True)
         return model
 
@@ -824,6 +825,26 @@ def _resolve_config_and_weights(pretrained_path: str) -> Tuple[str, str]:
             return config_path, weights_path
 
     raise FileNotFoundError(f"Missing model weights in {pretrained_path}")
+
+
+def _remap_attn_keys(state_dict: dict) -> dict:
+    mapping = (
+        (".query.", ".to_q."),
+        (".key.", ".to_k."),
+        (".value.", ".to_v."),
+        (".proj_attn.", ".to_out.0."),
+    )
+    remapped = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for src, dst in mapping:
+            if src in new_key:
+                new_key = new_key.replace(src, dst)
+        if new_key in state_dict and new_key != key:
+            # Prefer already-correct keys in the checkpoint.
+            continue
+        remapped[new_key] = value
+    return remapped
 
 
 def _load_state_dict(weights_path: str) -> dict:

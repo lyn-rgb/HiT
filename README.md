@@ -124,6 +124,37 @@ torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-L/2 --data-path /pat
 
 **Caution.** Resuming training will automatically restore both model, EMA, and optimizer states and training configs to be the same as in the checkpoint.
 
+## Parquet Extraction to ImageFolder
+
+If your dataset is stored in parquet files, you can export it into an ImageFolder-compatible layout using
+`extract_parquet_to_imagefolder.py`. The script will create `train/`, `val/`, and `test/` subdirectories
+and save images under class-id folders.
+
+```bash
+python extract_parquet_to_imagefolder.py \
+  --input /path/to/parquet_dir \
+  --output /path/to/imagefolder \
+  --all \
+  --num-workers 8
+```
+
+## Pre-extract VAE Latents
+
+To speed up SiT training, you can pre-extract VAE latents (mu/logvar) into an ImageFolder-like directory
+and then point `train.py` at the latent root.
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N extract_vae_latents.py \
+  --data-path /path/to/imagenet/train \
+  --output /path/to/latents/train \
+  --image-size 256 \
+  --batch-size 64
+
+torchrun --nnodes=1 --nproc_per_node=N train.py \
+  --data-path /path/to/imagenet/train \
+  --latent-path /path/to/latents/train
+```
+
 ## Training Hierarchical VAE
 
 We provide a stage-wise training script for the hierarchical VAE in [`train_hvae.py`](train_hvae.py). Training is done one VAE at a time:
@@ -246,4 +277,3 @@ versus 2.06 in the paper).
 
 ## License
 This project is under the MIT license. See [LICENSE](LICENSE.txt) for details.
-

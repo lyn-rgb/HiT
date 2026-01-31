@@ -33,7 +33,7 @@ from download import find_model
 from transport import create_transport, Sampler
 from vae import AutoencoderKL
 from train_utils import parse_transport_args
-from data_utils import ParquetImageDataset
+from data_utils import ParquetImageDataset, VAELatentDataset
 import wandb_utils
 from log_utils import TrainingLogger
 from snapshot_utils import snapshot_code
@@ -207,7 +207,10 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    if args.data_format == "parquet":
+    use_latents = args.latent_path is not None
+    if use_latents:
+        dataset = VAELatentDataset(args.latent_path)
+    elif args.data_format == "parquet":
         dataset = ParquetImageDataset(
             args.data_path,
             transform=transform,
@@ -269,12 +272,22 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(vae_scale)
+        for batch in loader:
+            if use_latents:
+                mu, logvar, y = batch
+                mu = mu.to(device)
+                logvar = logvar.to(device)
+                y = y.to(device)
+                with torch.no_grad():
+                    eps = torch.randn_like(mu)
+                    x = (mu + eps * torch.exp(0.5 * logvar)).mul_(vae_scale)
+            else:
+                x, y = batch
+                x = x.to(device)
+                y = y.to(device)
+                with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(vae_scale)
             model_kwargs = dict(y=y)
             with amp_autocast(dtype=autocast_dtype):
                 loss_dict = transport.training_losses(model, x, model_kwargs)
@@ -350,7 +363,7 @@ def main(args):
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
                     samples = vae.decode(samples / vae_scale).sample
-                    out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
+                    out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device, dtype=samples.dtype)
                     dist.all_gather_into_tensor(out_samples, samples)
 
                 if args.wandb:
@@ -386,6 +399,8 @@ if __name__ == "__main__":
                         choices=["imagefolder", "parquet"])
     parser.add_argument("--parquet-image-key", type=str, default="image")
     parser.add_argument("--parquet-label-key", type=str, default="label")
+    parser.add_argument("--latent-path", type=str, default=None,
+                        help="Optional root with pre-extracted VAE latents (class subdirs of .pt files).")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)

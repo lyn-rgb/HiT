@@ -40,6 +40,15 @@ def _resolve_parquet_files(path: str, subset: Optional[str] = None) -> List[str]
     return files
 
 
+def _find_class_folders(root: str) -> List[str]:
+    classes = [
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d))
+    ]
+    classes.sort()
+    return classes
+
+
 class ParquetImageDataset(Dataset):
     def __init__(
         self,
@@ -196,3 +205,35 @@ class ParquetImageDataset(Dataset):
         if isinstance(label, torch.Tensor):
             label = label.item()
         return image, int(label)
+
+
+class VAELatentDataset(Dataset):
+    def __init__(self, root: str):
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"Latent root directory not found: {root}")
+        self.root = root
+        self.classes = _find_class_folders(root)
+        if not self.classes:
+            raise FileNotFoundError(f"No class subfolders found at {root}")
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+
+        self.samples: List[Tuple[str, int]] = []
+        for cls_name in self.classes:
+            class_dir = os.path.join(root, cls_name)
+            for path in sorted(glob(os.path.join(class_dir, "*.pt"))):
+                self.samples.append((path, self.class_to_idx[cls_name]))
+
+        if not self.samples:
+            raise FileNotFoundError(f"No .pt latent files found under {root}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        data = torch.load(path, map_location="cpu")
+        if "mu" not in data or "logvar" not in data:
+            raise KeyError(f"Missing 'mu'/'logvar' in {path}")
+        mu = data["mu"]
+        logvar = data["logvar"]
+        return mu, logvar, label
