@@ -30,3 +30,23 @@ def parse_sde_args(parser):
                         help="form of last step taken in the SDE")
     group.add_argument("--last-step-size", type=float, default=0.04, \
                         help="size of the last step taken")
+
+
+class ResumableBatchSampler:
+    def __init__(self, batch_sampler):
+        self.batch_sampler = batch_sampler
+        self.start_step = 0
+
+    def set_start_step(self, start_step: int):
+        self.start_step = max(0, int(start_step))
+
+    def __iter__(self):
+        for idx, batch in enumerate(self.batch_sampler):
+            if idx < self.start_step:
+                continue
+            yield batch
+
+    def __len__(self):
+        total = len(self.batch_sampler)
+        remaining = total - self.start_step
+        return remaining if remaining > 0 else 0

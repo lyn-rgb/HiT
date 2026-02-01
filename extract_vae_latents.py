@@ -152,6 +152,7 @@ def main(args):
 
     log_every = 100
     processed = 0
+    total_num_batchs = len(loader)
     with torch.no_grad():
         for batch_idx, (images, labels, paths) in enumerate(loader):
             images = images.to(device)
@@ -177,7 +178,7 @@ def main(args):
             if rank == 0 and (batch_idx + 1) % log_every == 0:
                 elapsed = time() - start_time if start_time is not None else 0.0
                 imgs_per_sec = processed / elapsed if elapsed > 0 else 0.0
-                total = len(dataset)
+                total = total_num_batchs * args.batch_size
                 remaining = max(0, total - processed)
                 eta = _format_eta(remaining / imgs_per_sec if imgs_per_sec > 0 else 0.0)
                 print(

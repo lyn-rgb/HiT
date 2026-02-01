@@ -12,7 +12,7 @@ torch.backends.cudnn.benchmark = True
 import torch.distributed as dist
 torch.set_num_threads(1)
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, BatchSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -28,6 +28,7 @@ import argparse
 import logging
 import os
 import signal
+import textwrap
 
 from vae import AutoencoderKL
 from muon import MuonWithAuxAdam
@@ -38,6 +39,7 @@ import tb_utils
 
 warnings.filterwarnings("ignore")
 from data_utils import ParquetImageDataset
+from train_utils import ResumableBatchSampler
 
 PngImagePlugin.MAX_TEXT_CHUNK = (1024 ** 2) * 64    # to avoid image load error `Decompressed Data Too Large`
 Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle large images explicitly.
@@ -86,6 +88,21 @@ def _find_latest_checkpoint(results_dir: str) -> str | None:
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def _format_args(args) -> str:
+    items = sorted(vars(args).items(), key=lambda kv: kv[0])
+    lines = ["Training configuration:"]
+    for key, value in items:
+        value_str = repr(value)
+        wrapped = textwrap.wrap(value_str, width=72)
+        if not wrapped:
+            lines.append(f"  - {key}:")
+        else:
+            lines.append(f"  - {key}: {wrapped[0]}")
+            for cont in wrapped[1:]:
+                lines.append(f"    {cont}")
+    return "\n".join(lines)
 
 
 def center_crop_arr(pil_image, image_size):
@@ -152,6 +169,7 @@ def main(args):
             os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        logger.info(_format_args(args))
         if args.run_notes:
             logger.info(f"Run notes: {args.run_notes}")
         if args.save_code:
@@ -172,9 +190,14 @@ def main(args):
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     vae_path = args.vae_path or f"stabilityai/sd-vae-ft-{args.vae}"
     vae = AutoencoderKL.from_pretrained(vae_path)
+    resume_train_steps = 0
     if args.ckpt is not None:
         state = torch.load(args.ckpt, map_location="cpu")
         vae.load_state_dict(state["model"])
+        resume_train_steps = state.get("train_steps", 0)
+        if rank == 0:
+            logger.info(f"Resuming from checkpoint: {args.ckpt}")
+            logger.info(f"Resume train_steps: {resume_train_steps}")
     ema = deepcopy(vae).to(device)
     for p in ema.parameters():
         p.requires_grad = False
@@ -225,6 +248,7 @@ def main(args):
             "ema": ema.state_dict(),
             "opt": opt.state_dict(),
             "args": args,
+            "train_steps": train_steps,
         }
         last_path = os.path.join(checkpoint_dir, "last.pt")
         torch.save(checkpoint, last_path)
@@ -263,34 +287,44 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
+    batch_sampler = BatchSampler(sampler, batch_size=local_batch_size, drop_last=True)
+    resume_batch_sampler = ResumableBatchSampler(batch_sampler)
     loader = DataLoader(
         dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        sampler=sampler,
+        batch_sampler=resume_batch_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
-        pin_memory_device=args.pin_memory_device,
-        drop_last=True
+        pin_memory_device=args.pin_memory_device
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = resume_train_steps
     log_steps = 0
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
-    total_steps = args.epochs * len(loader)
+    steps_per_epoch = len(batch_sampler)
+    total_steps = args.epochs * steps_per_epoch
+    start_epoch = train_steps // steps_per_epoch
+    start_step_in_epoch = train_steps % steps_per_epoch
     start_time = time()
     train_start_time = start_time
+    if rank == 0:
+        logger.info(f"Total training steps: {total_steps:,}")
+        if train_steps > 0:
+            logger.info(
+                f"Resuming at epoch {start_epoch} step {start_step_in_epoch} "
+                f"(global step {train_steps})"
+            )
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        resume_batch_sampler.set_start_step(start_step_in_epoch if epoch == start_epoch else 0)
         for x, _ in loader:
             x = x.to(device)
             with amp_autocast(dtype=autocast_dtype):

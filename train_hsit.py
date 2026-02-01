@@ -15,7 +15,7 @@ torch.backends.cudnn.benchmark = True
 import torch.distributed as dist
 torch.set_num_threads(1)
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, BatchSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -31,14 +31,15 @@ import argparse
 import logging
 import os
 import json
-import itertools
 import signal
+import textwrap
 
 from models import HierarchicalSiT_models
 from transport import create_transport, Sampler
 from vae import AutoencoderKL, HierarchicalVAE
 from train_utils import parse_transport_args
 from data_utils import ParquetImageDataset
+from train_utils import ResumableBatchSampler
 from muon import MuonWithAuxAdam
 import wandb_utils
 from log_utils import TrainingLogger
@@ -94,6 +95,21 @@ def _find_latest_checkpoint(results_dir: str) -> str | None:
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def _format_args(args) -> str:
+    items = sorted(vars(args).items(), key=lambda kv: kv[0])
+    lines = ["Training configuration:"]
+    for key, value in items:
+        value_str = repr(value)
+        wrapped = textwrap.wrap(value_str, width=72)
+        if not wrapped:
+            lines.append(f"  - {key}:")
+        else:
+            lines.append(f"  - {key}: {wrapped[0]}")
+            for cont in wrapped[1:]:
+                lines.append(f"    {cont}")
+    return "\n".join(lines)
 
 
 def center_crop_arr(pil_image, image_size):
@@ -218,6 +234,7 @@ def main(args):
             os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        logger.info(_format_args(args))
         if args.run_notes:
             logger.info(f"Run notes: {args.run_notes}")
         if args.save_code:
@@ -257,17 +274,16 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
+    batch_sampler = BatchSampler(sampler, batch_size=local_batch_size, drop_last=True)
+    resume_batch_sampler = ResumableBatchSampler(batch_sampler)
     loader = DataLoader(
         dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        sampler=sampler,
+        batch_sampler=resume_batch_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
-        pin_memory_device=args.pin_memory_device,
-        drop_last=True
+        pin_memory_device=args.pin_memory_device
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
@@ -291,8 +307,7 @@ def main(args):
 
     # Build model after probing latent shapes.
     sampler.set_epoch(0)
-    loader_iter = iter(loader)
-    first_batch = next(loader_iter)
+    first_batch = next(iter(loader))
     with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
         x_probe, y_probe = first_batch
         x_probe = x_probe.to(device)
@@ -318,12 +333,17 @@ def main(args):
     ema = deepcopy(model).to(device)
 
     state_dict = None
+    resume_train_steps = 0
     if args.ckpt is not None:
         ckpt_path = args.ckpt
         state_dict = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(state_dict["model"])
         ema.load_state_dict(state_dict["ema"])
         args = state_dict["args"]
+        resume_train_steps = state_dict.get("train_steps", 0)
+        if rank == 0:
+            logger.info(f"Resuming from checkpoint: {ckpt_path}")
+            logger.info(f"Resume train_steps: {resume_train_steps}")
 
     for p in ema.parameters():
         p.requires_grad = False
@@ -354,6 +374,7 @@ def main(args):
             "ema": ema.state_dict(),
             "opt": opt.state_dict(),
             "args": args,
+            "train_steps": train_steps,
         }
         last_path = os.path.join(checkpoint_dir, "last.pt")
         torch.save(checkpoint, last_path)
@@ -370,12 +391,22 @@ def main(args):
         signal.signal(signal.SIGTERM, _handle_signal)
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = resume_train_steps
     log_steps = 0
     running_loss = 0.0
-    total_steps = args.epochs * len(loader)
+    steps_per_epoch = len(batch_sampler)
+    total_steps = args.epochs * steps_per_epoch
+    start_epoch = train_steps // steps_per_epoch
+    start_step_in_epoch = train_steps % steps_per_epoch
     start_time = time()
     train_start_time = start_time
+    if rank == 0:
+        logger.info(f"Total training steps: {total_steps:,}")
+        if train_steps > 0:
+            logger.info(
+                f"Resuming at epoch {start_epoch} step {start_step_in_epoch} "
+                f"(global step {train_steps})"
+            )
     sample_enabled = args.train_level <= 1
 
     sample_zs = torch.randn_like(latent)
@@ -391,14 +422,11 @@ def main(args):
         sample_cond = None
 
     logger.info(f"Training HSIT for {args.epochs} epochs on level {args.train_level}...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        if epoch == 0:
-            batch_iter = itertools.chain([first_batch], loader_iter)
-        else:
-            batch_iter = loader
-        for batch in batch_iter:
+        resume_batch_sampler.set_start_step(start_step_in_epoch if epoch == start_epoch else 0)
+        for batch in loader:
             x, y = batch
             x = x.to(device)
             y = y.to(device)
