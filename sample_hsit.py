@@ -61,14 +61,6 @@ def load_json_arg(value, name):
         raise ValueError(f"{name} must be a JSON string or a path to a JSON file.") from exc
 
 
-def decode_from_level(hvae, latent, level):
-    if level == 0:
-        return hvae.base_vae.decode(latent / hvae.base_vae.scaling_factor).sample
-    current = latent
-    for idx in range(level - 1, -1, -1):
-        sub_vae = hvae.sub_vaes[idx]
-        current = sub_vae.decode(current / sub_vae.scaling_factor).sample
-    return hvae.base_vae.decode(current).sample
 
 
 def main(args):
@@ -178,7 +170,7 @@ def main(args):
         eta = _format_eta((args.num_levels - level - 1) * elapsed / max(1, level + 1))
         print(f"Sampled level {level} in {elapsed:.2f}s, ETA {eta}.")
 
-    decoded = decode_from_level(hvae, prev_latent, args.num_levels - 1)
+    decoded = hvae.decode_from_level(prev_latent, args.num_levels - 1)
 
     os.makedirs(args.outdir, exist_ok=True)
     nrow = int(math.sqrt(num_samples)) if int(math.sqrt(num_samples)) ** 2 == num_samples else 4

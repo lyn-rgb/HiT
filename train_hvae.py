@@ -31,6 +31,7 @@ import argparse
 import logging
 import os
 import json
+import signal
 
 from vae import AutoencoderKL, HierarchicalVAE
 from muon import MuonWithAuxAdam
@@ -80,6 +81,13 @@ def _format_eta(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _find_latest_checkpoint(results_dir: str) -> str | None:
+    candidates = glob(os.path.join(results_dir, "**", "checkpoints", "*.pt"), recursive=True)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
 
 
 def center_crop_arr(pil_image, image_size):
@@ -135,13 +143,22 @@ def load_json_arg(value, name):
         raise ValueError(f"{name} must be a JSON string or a path to a JSON file.") from exc
 
 
-def compute_mu_for_level(hvae, x, level):
+def _sample_latent(posterior, noise_scale: float):
+    if noise_scale == 0.0:
+        return posterior.mean
+    eps = torch.randn_like(posterior.mean)
+    return posterior.mean + eps * posterior.std * noise_scale
+
+
+def compute_latent_for_level(hvae, x, level, noise_scale: float):
     posterior = hvae.base_vae.encode(x).latent_dist
-    mu = posterior.mean
+    latent = _sample_latent(posterior, noise_scale)
     for i in range(level - 1):
-        sub_posterior = hvae.sub_vaes[i].encode(mu).latent_dist
-        mu = sub_posterior.mean
-    return mu
+        sub_posterior = hvae.sub_vaes[i].encode(latent).latent_dist
+        latent = _sample_latent(sub_posterior, noise_scale)
+    return latent
+
+
 
 
 #################################################################################
@@ -168,14 +185,26 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
 
+    resume_ckpt = None
+    resume_experiment_dir = None
+    if args.auto_resume and args.ckpt is None:
+        resume_ckpt = _find_latest_checkpoint(args.results_dir)
+        if resume_ckpt is not None:
+            args.ckpt = resume_ckpt
+            resume_experiment_dir = os.path.dirname(os.path.dirname(resume_ckpt))
+
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        experiment_name = f"{experiment_index:03d}-hvae-l{args.train_level}"
-        experiment_dir = f"{args.results_dir}/{experiment_name}"
-        checkpoint_dir = f"{experiment_dir}/checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if resume_experiment_dir is not None:
+            experiment_dir = resume_experiment_dir
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+        else:
+            experiment_index = len(glob(f"{args.results_dir}/*"))
+            experiment_name = f"{experiment_index:03d}-hvae-l{args.train_level}"
+            experiment_dir = f"{args.results_dir}/{experiment_name}"
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.run_notes:
@@ -192,6 +221,7 @@ def main(args):
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
         tb_writer = None
         experiment_dir = None
+        checkpoint_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -266,13 +296,36 @@ def main(args):
         ]
         opt = MuonWithAuxAdam(param_groups)
     else:
-        opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
+    opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
     if args.ckpt is not None and "opt" in state:
         opt.load_state_dict(state["opt"])
+
+    def _save_last_ckpt():
+        if rank != 0 or checkpoint_dir is None:
+            return
+        checkpoint = {
+            "model": hvae.module.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args,
+        }
+        last_path = os.path.join(checkpoint_dir, "last.pt")
+        torch.save(checkpoint, last_path)
+        logger.info(f"Saved checkpoint to {last_path}")
+
+    def _handle_signal(signum, _frame):
+        logger.info(f"Received signal {signum}. Saving last checkpoint...")
+        _save_last_ckpt()
+        cleanup()
+        raise SystemExit(0)
+
+    if rank == 0:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
     # Setup data:
     transform = transforms.Compose([
@@ -336,7 +389,7 @@ def main(args):
                     kl_loss = posterior.kl().mean()
                 else:
                     with torch.no_grad():
-                        mu = compute_mu_for_level(hvae.module, x, target_level)
+                        mu = compute_latent_for_level(hvae.module, x, target_level, args.input_noise_scale)
                     sub_vae = hvae.module.sub_vaes[target_level - 1]
                     posterior = sub_vae.encode(mu).latent_dist
                     z = posterior.sample()
@@ -435,15 +488,23 @@ def main(args):
                                 value_range=(-1, 1),
                             )
                     else:
-                        torch.save(
-                            {
-                                "mu": mu.detach().cpu(),
-                                "recon": recon.detach().cpu(),
-                                "train_level": target_level,
-                                "step": train_steps,
-                            },
-                            os.path.join(recon_dir, "recon.pt"),
-                        )
+                        with torch.no_grad():
+                            decoded = hvae.module.decode_from_level(recon, target_level)
+                        x_cpu = x.detach().cpu()
+                        decoded_cpu = decoded.detach().cpu()
+                        for idx in range(x_cpu.shape[0]):
+                            save_image(
+                                x_cpu[idx],
+                                os.path.join(recon_dir, f"input_{idx:04d}.png"),
+                                normalize=True,
+                                value_range=(-1, 1),
+                            )
+                            save_image(
+                                decoded_cpu[idx],
+                                os.path.join(recon_dir, f"recon_{idx:04d}.png"),
+                                normalize=True,
+                                value_range=(-1, 1),
+                            )
                     logger.info(f"Saved reconstructions to {recon_dir}")
 
             # Save VAE checkpoint:
@@ -519,6 +580,8 @@ if __name__ == "__main__":
     parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--kl-weight", type=float, default=1e-6)
+    parser.add_argument("--input-noise-scale", type=float, default=1.0,
+                        help="Noise scale for sampling previous-level latents (0 disables noise, uses mu)")
     parser.add_argument("--level-lrs", type=str, default=None,
                         help="Comma-separated learning rates per level (length=num_levels)")
     parser.add_argument("--level-recon-weights", type=str, default=None,
@@ -536,6 +599,8 @@ if __name__ == "__main__":
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a hierarchical VAE checkpoint to resume from")
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     args = parser.parse_args()
     main(args)

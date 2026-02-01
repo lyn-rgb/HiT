@@ -27,6 +27,7 @@ from time import time
 import argparse
 import logging
 import os
+import signal
 
 from vae import AutoencoderKL
 from muon import MuonWithAuxAdam
@@ -80,6 +81,13 @@ def _format_eta(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _find_latest_checkpoint(results_dir: str) -> str | None:
+    candidates = glob(os.path.join(results_dir, "**", "checkpoints", "*.pt"), recursive=True)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
@@ -122,14 +130,26 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
 
+    resume_ckpt = None
+    resume_experiment_dir = None
+    if args.auto_resume and args.ckpt is None:
+        resume_ckpt = _find_latest_checkpoint(args.results_dir)
+        if resume_ckpt is not None:
+            args.ckpt = resume_ckpt
+            resume_experiment_dir = os.path.dirname(os.path.dirname(resume_ckpt))
+
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        experiment_name = f"{experiment_index:03d}-vae"
-        experiment_dir = f"{args.results_dir}/{experiment_name}"
-        checkpoint_dir = f"{experiment_dir}/checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if resume_experiment_dir is not None:
+            experiment_dir = resume_experiment_dir
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+        else:
+            experiment_index = len(glob(f"{args.results_dir}/*"))
+            experiment_name = f"{experiment_index:03d}-vae"
+            experiment_dir = f"{args.results_dir}/{experiment_name}"
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.run_notes:
@@ -146,6 +166,7 @@ def main(args):
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
         tb_writer = None
         experiment_dir = None
+        checkpoint_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -195,6 +216,29 @@ def main(args):
         opt.load_state_dict(state["opt"])
     if args.ckpt is not None and "ema" in state:
         ema.load_state_dict(state["ema"])
+
+    def _save_last_ckpt():
+        if rank != 0 or checkpoint_dir is None:
+            return
+        checkpoint = {
+            "model": vae.module.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args,
+        }
+        last_path = os.path.join(checkpoint_dir, "last.pt")
+        torch.save(checkpoint, last_path)
+        logger.info(f"Saved checkpoint to {last_path}")
+
+    def _handle_signal(signum, _frame):
+        logger.info(f"Received signal {signum}. Saving last checkpoint...")
+        _save_last_ckpt()
+        cleanup()
+        raise SystemExit(0)
+
+    if rank == 0:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
     # Setup data:
     transform = transforms.Compose([
@@ -424,6 +468,8 @@ if __name__ == "__main__":
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a VAE checkpoint to resume from")
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     args = parser.parse_args()
     main(args)

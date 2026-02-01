@@ -32,6 +32,7 @@ import logging
 import os
 import json
 import itertools
+import signal
 
 from models import HierarchicalSiT_models
 from transport import create_transport, Sampler
@@ -88,6 +89,13 @@ def _format_eta(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _find_latest_checkpoint(results_dir: str) -> str | None:
+    candidates = glob(os.path.join(results_dir, "**", "checkpoints", "*.pt"), recursive=True)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
@@ -124,15 +132,22 @@ def load_json_arg(value, name):
         raise ValueError(f"{name} must be a JSON string or a path to a JSON file.") from exc
 
 
-def compute_mu_pyramid(hvae, x):
+def _sample_latent(posterior, noise_scale: float):
+    if noise_scale == 0.0:
+        return posterior.mean
+    eps = torch.randn_like(posterior.mean)
+    return posterior.mean + eps * posterior.std * noise_scale
+
+
+def compute_latent_pyramid(hvae, x, noise_scale: float):
     posterior = hvae.base_vae.encode(x).latent_dist
-    mu = posterior.mean
-    mus = [mu]
+    latent = _sample_latent(posterior, noise_scale)
+    latents = [latent]
     for sub_vae in hvae.sub_vaes:
-        sub_posterior = sub_vae.encode(mu).latent_dist
-        mu = sub_posterior.mean
-        mus.append(mu)
-    return mus
+        sub_posterior = sub_vae.encode(latent).latent_dist
+        latent = _sample_latent(sub_posterior, noise_scale)
+        latents.append(latent)
+    return latents
 
 
 def _build_muon_param_groups(model, args):
@@ -180,15 +195,27 @@ def main(args):
     assert args.global_batch_size % dist.get_world_size() == 0, "Batch size must be divisible by world size."
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
 
+    resume_ckpt = None
+    resume_experiment_dir = None
+    if args.auto_resume and args.ckpt is None:
+        resume_ckpt = _find_latest_checkpoint(args.results_dir)
+        if resume_ckpt is not None:
+            args.ckpt = resume_ckpt
+            resume_experiment_dir = os.path.dirname(os.path.dirname(resume_ckpt))
+
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")
-        experiment_name = f"{experiment_index:03d}-{model_string_name}-level{args.train_level}"
-        experiment_dir = f"{args.results_dir}/{experiment_name}"
-        checkpoint_dir = f"{experiment_dir}/checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if resume_experiment_dir is not None:
+            experiment_dir = resume_experiment_dir
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+        else:
+            experiment_index = len(glob(f"{args.results_dir}/*"))
+            model_string_name = args.model.replace("/", "-")
+            experiment_name = f"{experiment_index:03d}-{model_string_name}-level{args.train_level}"
+            experiment_dir = f"{args.results_dir}/{experiment_name}"
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.run_notes:
@@ -269,7 +296,7 @@ def main(args):
     with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
         x_probe, y_probe = first_batch
         x_probe = x_probe.to(device)
-        mus = compute_mu_pyramid(hvae, x_probe)
+        mus = compute_latent_pyramid(hvae, x_probe, args.input_noise_scale)
         latent = mus[args.train_level]
         cond_latent = mus[args.train_level - 1] if args.train_level > 0 else None
 
@@ -319,6 +346,29 @@ def main(args):
     if state_dict is not None and "opt" in state_dict:
         opt.load_state_dict(state_dict["opt"])
 
+    def _save_last_ckpt():
+        if rank != 0 or checkpoint_dir is None:
+            return
+        checkpoint = {
+            "model": model.module.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args,
+        }
+        last_path = os.path.join(checkpoint_dir, "last.pt")
+        torch.save(checkpoint, last_path)
+        logger.info(f"Saved checkpoint to {last_path}")
+
+    def _handle_signal(signum, _frame):
+        logger.info(f"Received signal {signum}. Saving last checkpoint...")
+        _save_last_ckpt()
+        cleanup()
+        raise SystemExit(0)
+
+    if rank == 0:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+
     # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
@@ -353,7 +403,7 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
-                mus = compute_mu_pyramid(hvae, x)
+                mus = compute_latent_pyramid(hvae, x, args.input_noise_scale)
                 latent = mus[args.train_level]
                 cond_latent = mus[args.train_level - 1] if args.train_level > 0 else None
                 scale = hvae.base_vae.scaling_factor if args.train_level == 0 else hvae.sub_vaes[args.train_level - 1].scaling_factor
@@ -497,6 +547,8 @@ def parse_args():
                         help="Which level to train: 0=base, 1..=sub")
     parser.add_argument("--sub-vae-configs", type=str, default=None,
                         help="JSON string or path to JSON file with per-sub-vae configs")
+    parser.add_argument("--input-noise-scale", type=float, default=1.0,
+                        help="Noise scale for sampling previous-level latents (0 disables noise, uses mu)")
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
@@ -538,6 +590,8 @@ def parse_args():
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a HSIT checkpoint to resume from")
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
                         help="FlashAttention version to use")
     parser.add_argument("--grad-checkpoint", action="store_true",

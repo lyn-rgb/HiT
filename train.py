@@ -29,6 +29,7 @@ import argparse
 import logging
 import os
 import math
+import signal
 
 from models import SiT_models
 from download import find_model
@@ -94,6 +95,13 @@ def _format_eta(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _find_latest_checkpoint(results_dir: str) -> str | None:
+    candidates = glob(os.path.join(results_dir, "**", "checkpoints", "*.pt"), recursive=True)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
 
 def _build_muon_param_groups(model, args):
     hidden_weights = [p for p in model.blocks.parameters() if p.ndim >= 2]
@@ -167,16 +175,28 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
 
+    resume_ckpt = None
+    resume_experiment_dir = None
+    if args.auto_resume and args.ckpt is None:
+        resume_ckpt = _find_latest_checkpoint(args.results_dir)
+        if resume_ckpt is not None:
+            args.ckpt = resume_ckpt
+            resume_experiment_dir = os.path.dirname(os.path.dirname(resume_ckpt))
+
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
-        experiment_name = f"{experiment_index:03d}-{model_string_name}-" \
-                        f"{args.path_type}-{args.prediction}-{args.loss_weight}"
-        experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if resume_experiment_dir is not None:
+            experiment_dir = resume_experiment_dir
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+        else:
+            experiment_index = len(glob(f"{args.results_dir}/*"))
+            model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
+            experiment_name = f"{experiment_index:03d}-{model_string_name}-" \
+                            f"{args.path_type}-{args.prediction}-{args.loss_weight}"
+            experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
+            checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+            os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir, rank, log_all_ranks=args.log_all_ranks)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.run_notes:
@@ -193,6 +213,7 @@ def main(args):
         logger = create_logger("results", rank, log_all_ranks=args.log_all_ranks)
         tb_writer = None
         experiment_dir = None
+        checkpoint_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -246,6 +267,29 @@ def main(args):
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
+
+    def _save_last_ckpt():
+        if rank != 0 or checkpoint_dir is None:
+            return
+        checkpoint = {
+            "model": model.module.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args,
+        }
+        last_path = os.path.join(checkpoint_dir, "last.pt")
+        torch.save(checkpoint, last_path)
+        logger.info(f"Saved checkpoint to {last_path}")
+
+    def _handle_signal(signum, _frame):
+        logger.info(f"Received signal {signum}. Saving last checkpoint...")
+        _save_last_ckpt()
+        cleanup()
+        raise SystemExit(0)
+
+    if rank == 0:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
     # Setup data:
     transform = transforms.Compose([
@@ -506,6 +550,8 @@ if __name__ == "__main__":
                         help="Enable gradient checkpointing to reduce GPU memory usage")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     parse_transport_args(parser)
     args = parser.parse_args()
