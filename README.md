@@ -124,6 +124,25 @@ torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-L/2 --data-path /pat
 
 **Caution.** Resuming training will automatically restore both model, EMA, and optimizer states and training configs to be the same as in the checkpoint.
 
+## Muon Optimizer (Optional)
+
+Muon is intended for hidden weight matrices. Other parameters such as embeddings, classifier heads, and hidden gains/biases
+should be optimized with standard AdamW (via the auxiliary Adam group in `MuonWithAuxAdam`).
+
+This repo provides a `--optimizer muon` option in `train.py`, `train_vae.py`, and `train_hvae.py`. Parameter grouping is set
+to use Muon for matrix-like weights (e.g., transformer blocks or convolutional filters) and Adam for remaining parameters.
+
+Example:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N train.py \
+  --model SiT-XL/2 \
+  --data-path /path/to/imagenet/train \
+  --optimizer muon \
+  --muon-lr 0.02 --muon-weight-decay 0.01 --muon-momentum 0.95 \
+  --muon-aux-lr 3e-4 --muon-aux-betas 0.9 0.95 --muon-aux-weight-decay 0.01
+```
+
 ## Parquet Extraction to ImageFolder
 
 If your dataset is stored in parquet files, you can export it into an ImageFolder-compatible layout using
@@ -237,6 +256,44 @@ torchrun --nnodes=1 --nproc_per_node=N train_hvae.py \
 ```
 
 ## Evaluation (FID, Inception Score, etc.)
+
+## Training Hierarchical SiT (HSIT)
+
+We provide a stage-wise training script for a hierarchical diffusion transformer in [`train_hsit.py`](train_hsit.py).
+Each level is trained to model the corresponding hierarchical VAE latent, conditioned on the previous level's GT latent.
+
+```bash
+# Level 0 (base latent)
+torchrun --nnodes=1 --nproc_per_node=N train_hsit.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 0 \
+  --hvae-ckpt /path/to/hvae_checkpoint.pt
+
+# Level 1 (conditioned on base latent)
+torchrun --nnodes=1 --nproc_per_node=N train_hsit.py \
+  --data-path /path/to/imagenet/train \
+  --image-size 256 \
+  --num-levels 3 \
+  --train-level 1 \
+  --hvae-ckpt /path/to/hvae_checkpoint.pt
+```
+
+Use `--optimizer muon` to enable the Muon optimizer (see above). EMA sampling is enabled during training for levels 0 and 1.
+
+### HSIT Inference
+
+Use [`sample_hsit.py`](sample_hsit.py) to sample images with a chain of level-wise HSIT checkpoints:
+
+```bash
+python sample_hsit.py ODE \
+  --ckpt-levels /path/to/hsit_level0.pt,/path/to/hsit_level1.pt \
+  --num-levels 2 \
+  --image-size 256 \
+  --num-samples 8 \
+  --outdir samples
+```
 
 We include a [`sample_ddp.py`](sample_ddp.py) script which samples a large number of images from a SiT model in parallel. This script 
 generates a folder of samples as well as a `.npz` file which can be directly used with [ADM's TensorFlow

@@ -14,10 +14,18 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from vae import AutoencoderKL
 
+PngImagePlugin.MAX_TEXT_CHUNK = (1024 ** 2) * 64    # to avoid image load error `Decompressed Data Too Large`
 Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle large images explicitly.
+
+
+def pil_loader(path: str) -> Image.Image:
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    with open(path, "rb") as f:
+        img = Image.open(f).load()
+        return img.convert("RGB")
 
 
 def _writer_loop(q):
@@ -102,7 +110,7 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
     ])
-    dataset = ImageFolderWithPaths(args.data_path, transform=transform)
+    dataset = ImageFolderWithPaths(args.data_path, transform=transform, loader=pil_loader)
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,

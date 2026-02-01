@@ -19,7 +19,7 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 from torchvision.utils import save_image
 import numpy as np
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from collections import OrderedDict
 from copy import deepcopy
 from glob import glob
@@ -38,6 +38,15 @@ from snapshot_utils import snapshot_code
 import tb_utils
 from data_utils import ParquetImageDataset
 
+PngImagePlugin.MAX_TEXT_CHUNK = (1024 ** 2) * 64    # to avoid image load error `Decompressed Data Too Large`
+Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle large images explicitly.
+
+
+def pil_loader(path: str) -> Image.Image:
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    with open(path, "rb") as f:
+        img = Image.open(f).load()
+        return img.convert("RGB")
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -171,10 +180,10 @@ def main(args):
             logger.info(f"Run notes: {args.run_notes}")
         if args.save_code:
             snapshot_code(os.getcwd(), f"{experiment_dir}/code")
-
-        entity = os.environ.get("ENTITY")
-        project = os.environ.get("PROJECT")
+ 
         if args.wandb and entity and project:
+            entity = os.environ.get("ENTITY")
+            project = os.environ.get("PROJECT")
             wandb_utils.initialize(args, entity, experiment_name, project)
         tb_writer = tb_utils.setup(f"{experiment_dir}/tensorboard", enabled=args.tensorboard)
     else:
@@ -278,7 +287,7 @@ def main(args):
             label_key=args.parquet_label_key,
         )
     else:
-        dataset = ImageFolder(args.data_path, transform=transform)
+        dataset = ImageFolder(args.data_path, transform=transform, loader=pil_loader)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),

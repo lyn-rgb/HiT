@@ -38,7 +38,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         b, n, c = x.shape
         qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
@@ -61,6 +61,8 @@ class Attention(nn.Module):
             attn = attn.transpose(1, 2)
 
         x = attn.reshape(b, n, c)
+        if cond is not None:
+            x = x + cond
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -168,6 +170,30 @@ class SiTBlock(nn.Module):
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class HierarchicalSiTBlock(nn.Module):
+    """
+    SiT block with an extra conditioning stream injected before attention projection.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c, cond=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), cond=cond)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -331,6 +357,178 @@ class SiT(nn.Module):
         return torch.cat([eps, rest], dim=1)
 
 
+class HierarchicalSiT(nn.Module):
+    """
+    Hierarchical SiT that conditions on the previous-level latent in each block.
+    """
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+        fa_version=None,
+        cond_input_size=None,
+        cond_in_channels=4,
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.input_size = input_size
+        self.cond_input_size = cond_input_size or input_size
+
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.cond_embedder = PatchEmbed(
+            self.cond_input_size, patch_size, cond_in_channels, hidden_size, bias=True
+        )
+        self.cond_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        num_patches = self.x_embedder.num_patches
+        # Will use fixed sin-cos embedding:
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            HierarchicalSiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, fa_version=fa_version)
+            for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.grad_checkpointing = False
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        cw = self.cond_embedder.proj.weight.data
+        nn.init.xavier_uniform_(cw.view([cw.shape[0], -1]))
+        nn.init.constant_(self.cond_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in SiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def _encode_condition(self, cond):
+        if cond is None:
+            return None
+        if cond.shape[-2:] != (self.cond_input_size, self.cond_input_size):
+            cond = F.interpolate(
+                cond,
+                size=(self.cond_input_size, self.cond_input_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        cond_tokens = self.cond_embedder(cond)
+        cond_tokens = self.cond_proj(cond_tokens)
+        b, n, c = cond_tokens.shape
+        cond_grid = int(n ** 0.5)
+        cond_tokens = cond_tokens.reshape(b, cond_grid, cond_grid, c).permute(0, 3, 1, 2)
+        target_grid = int(self.x_embedder.num_patches ** 0.5)
+        if cond_grid != target_grid:
+            cond_tokens = F.interpolate(
+                cond_tokens,
+                size=(target_grid, target_grid),
+                mode="bilinear",
+                align_corners=False,
+            )
+        cond_tokens = cond_tokens.permute(0, 2, 3, 1).reshape(b, target_grid * target_grid, c)
+        return cond_tokens
+
+    def unpatchify(self, x):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def forward(self, x, t, y, cond=None):
+        x = self.x_embedder(x) + self.pos_embed
+        cond_tokens = self._encode_condition(cond)
+        t = self.t_embedder(t)
+        y = self.y_embedder(y, self.training)
+        c = t + y
+        for block in self.blocks:
+            if self.grad_checkpointing and self.training:
+                if not x.requires_grad:
+                    x = x.detach().requires_grad_(True)
+                try:
+                    x = checkpoint(block, x, c, cond_tokens, use_reentrant=False)
+                except TypeError:
+                    x = checkpoint(block, x, c, cond_tokens)
+            else:
+                x = block(x, c, cond_tokens)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        if self.learn_sigma:
+            x, _ = x.chunk(2, dim=1)
+        return x
+
+    def set_grad_checkpointing(self, enabled=True):
+        self.grad_checkpointing = enabled
+
+    def forward_with_cfg(self, x, t, y, cfg_scale, cond=None):
+        """
+        Forward pass with classifier-free guidance and hierarchical conditioning.
+        """
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        if cond is None:
+            combined_cond = None
+        else:
+            cond_half = cond[: len(cond) // 2]
+            combined_cond = torch.cat([cond_half, cond_half], dim=0)
+        model_out = self.forward(combined, t, y, cond=combined_cond)
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
@@ -432,4 +630,49 @@ SiT_models = {
     'SiT-L/2':  SiT_L_2,   'SiT-L/4':  SiT_L_4,   'SiT-L/8':  SiT_L_8,
     'SiT-B/2':  SiT_B_2,   'SiT-B/4':  SiT_B_4,   'SiT-B/8':  SiT_B_8,
     'SiT-S/2':  SiT_S_2,   'SiT-S/4':  SiT_S_4,   'SiT-S/8':  SiT_S_8,
+}
+
+
+def HSiT_XL_2(**kwargs):
+    return HierarchicalSiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+
+def HSiT_XL_4(**kwargs):
+    return HierarchicalSiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+
+def HSiT_XL_8(**kwargs):
+    return HierarchicalSiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+
+def HSiT_L_2(**kwargs):
+    return HierarchicalSiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+
+def HSiT_L_4(**kwargs):
+    return HierarchicalSiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+
+def HSiT_L_8(**kwargs):
+    return HierarchicalSiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+
+def HSiT_B_2(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+
+def HSiT_B_4(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+
+def HSiT_B_8(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+
+def HSiT_S_2(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+
+def HSiT_S_4(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+
+def HSiT_S_8(**kwargs):
+    return HierarchicalSiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+
+
+HierarchicalSiT_models = {
+    'SiT-XL/2': HSiT_XL_2,  'SiT-XL/4': HSiT_XL_4,  'SiT-XL/8': HSiT_XL_8,
+    'SiT-L/2':  HSiT_L_2,   'SiT-L/4':  HSiT_L_4,   'SiT-L/8':  HSiT_L_8,
+    'SiT-B/2':  HSiT_B_2,   'SiT-B/4':  HSiT_B_4,   'SiT-B/8':  HSiT_B_8,
+    'SiT-S/2':  HSiT_S_2,   'SiT-S/4':  HSiT_S_4,   'SiT-S/8':  HSiT_S_8,
 }
