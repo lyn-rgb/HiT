@@ -17,6 +17,8 @@ import numpy as np
 from PIL import Image
 from vae import AutoencoderKL
 
+Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle large images explicitly.
+
 
 def _writer_loop(q):
     while True:
@@ -48,9 +50,20 @@ def center_crop_arr(pil_image, image_size):
 
 class ImageFolderWithPaths(ImageFolder):
     def __getitem__(self, index):
-        image, label = super().__getitem__(index)
-        path, _ = self.samples[index]
-        return image, label, path
+        attempts = 0
+        last_err = None
+        while attempts < 5:
+            try:
+                image, label = super().__getitem__(index)
+                path, _ = self.samples[index]
+                return image, label, path
+            except Exception as e:
+                path, _ = self.samples[index]
+                print(f"[DataError] index={index} path={path} err={e}", flush=True)
+                last_err = e
+                attempts += 1
+                index = (index + 1) % len(self.samples)
+        raise last_err
 
 
 def parse_args():
