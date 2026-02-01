@@ -302,13 +302,14 @@ def main(args):
 
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
+    def amp_autocast():
+        return torch.cuda.amp.autocast(dtype=autocast_dtype) if use_amp else nullcontext()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
 
     # Build model after probing latent shapes.
     sampler.set_epoch(0)
     first_batch = next(iter(loader))
-    with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+    with torch.no_grad(), amp_autocast():
         x_probe, y_probe = first_batch
         x_probe = x_probe.to(device)
         mus = compute_latent_pyramid(hvae, x_probe, args.input_noise_scale)
@@ -430,7 +431,7 @@ def main(args):
             x, y = batch
             x = x.to(device)
             y = y.to(device)
-            with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+            with torch.no_grad(), amp_autocast():
                 mus = compute_latent_pyramid(hvae, x, args.input_noise_scale)
                 latent = mus[args.train_level]
                 cond_latent = mus[args.train_level - 1] if args.train_level > 0 else None
@@ -443,7 +444,7 @@ def main(args):
             model_kwargs = {"y": y}
             if cond_latent is not None:
                 model_kwargs["cond"] = cond_latent
-            with amp_autocast(dtype=autocast_dtype):
+            with amp_autocast():
                 loss_dict = transport.training_losses(model, latent, model_kwargs)
                 loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -508,7 +509,7 @@ def main(args):
                         logger.info("Skipping sampling for train_level > 1 (no direct image decoder).")
                     continue
                 logger.info("Generating EMA samples...")
-                with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+                with torch.no_grad(), amp_autocast():
                     model_fn = ema.forward
                     model_kwargs = {"y": sample_y}
                     if sample_cond is not None:

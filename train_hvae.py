@@ -322,7 +322,8 @@ def main(args):
         opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
+    def amp_autocast():
+        return torch.cuda.amp.autocast(dtype=autocast_dtype) if use_amp else nullcontext()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
     if args.ckpt is not None and "opt" in state:
         opt.load_state_dict(state["opt"])
@@ -414,7 +415,7 @@ def main(args):
         resume_batch_sampler.set_start_step(start_step_in_epoch if epoch == start_epoch else 0)
         for x, _ in loader:
             x = x.to(device)
-            with amp_autocast(dtype=autocast_dtype):
+            with amp_autocast():
                 if target_level == 0:
                     posterior = hvae.module.base_vae.encode(x).latent_dist
                     z = posterior.sample()

@@ -287,7 +287,8 @@ def main(args):
         opt.load_state_dict(state_dict["opt"])
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
+    def amp_autocast():
+        return torch.cuda.amp.autocast(dtype=autocast_dtype) if use_amp else nullcontext()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
 
     def _save_last_ckpt():
@@ -412,11 +413,11 @@ def main(args):
                 x, y = batch
                 x = x.to(device)
                 y = y.to(device)
-                with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+                with torch.no_grad(), amp_autocast():
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(vae_scale)
             model_kwargs = dict(y=y)
-            with amp_autocast(dtype=autocast_dtype):
+            with amp_autocast():
                 loss_dict = transport.training_losses(model, x, model_kwargs)
                 loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -483,7 +484,7 @@ def main(args):
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 logger.info("Generating EMA samples...")
-                with torch.no_grad(), amp_autocast(dtype=autocast_dtype):
+                with torch.no_grad(), amp_autocast():
                     sample_fn = transport_sampler.sample_ode() # default to ode sampling
                     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
                     dist.barrier()
