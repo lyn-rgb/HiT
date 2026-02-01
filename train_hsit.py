@@ -488,13 +488,7 @@ def main(args):
                     sample_fn = transport_sampler.sample_ode()
                     samples = sample_fn(sample_zs, model_fn, **model_kwargs)[-1]
 
-                    if args.train_level == 0:
-                        decoded = hvae.base_vae.decode(samples / hvae.base_vae.scaling_factor).sample
-                    else:
-                        prev_mu = hvae.sub_vaes[0].decode(
-                            samples / hvae.sub_vaes[0].scaling_factor
-                        ).sample
-                        decoded = hvae.base_vae.decode(prev_mu).sample
+                    decoded = hvae.decode_from_level(samples, args.train_level, assume_scaled=True)
 
                     out_samples = torch.zeros(
                         (args.global_batch_size, 3, args.image_size, args.image_size),
