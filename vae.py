@@ -786,16 +786,19 @@ class HierarchicalVAE(nn.Module):
             sub_recons=tuple(sub_recons),
         )
 
-    def decode_from_level(self, latent: torch.Tensor, level: int) -> torch.Tensor:
+    def decode_from_level(self, latent: torch.Tensor, level: int, assume_scaled: bool = True) -> torch.Tensor:
         if level < 0 or level >= self.num_levels:
             raise ValueError(f"level must be in [0, {self.num_levels - 1}], got {level}")
         if level == 0:
-            return self.base_vae.decode(latent / self.base_vae.scaling_factor).sample
+            scale = self.base_vae.scaling_factor if assume_scaled else 1.0
+            return self.base_vae.decode(latent / scale).sample
         current = latent
         for idx in range(level - 1, -1, -1):
             sub_vae = self.sub_vaes[idx]
-            current = sub_vae.decode(current / sub_vae.scaling_factor).sample
-        return self.base_vae.decode(current / self.base_vae.scaling_factor).sample
+            scale = sub_vae.scaling_factor if assume_scaled else 1.0
+            current = sub_vae.decode(current / scale).sample
+        base_scale = self.base_vae.scaling_factor if assume_scaled else 1.0
+        return self.base_vae.decode(current / base_scale).sample
 
 
 def _resolve_pretrained_path(pretrained_path: str) -> str:

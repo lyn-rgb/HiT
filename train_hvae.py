@@ -296,7 +296,7 @@ def main(args):
         ]
         opt = MuonWithAuxAdam(param_groups)
     else:
-    opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
+        opt = torch.optim.AdamW(train_params, lr=lr, weight_decay=0)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
@@ -489,7 +489,7 @@ def main(args):
                             )
                     else:
                         with torch.no_grad():
-                            decoded = hvae.module.decode_from_level(recon, target_level)
+                            decoded = hvae.module.decode_from_level(recon, target_level, assume_scaled=False)
                         x_cpu = x.detach().cpu()
                         decoded_cpu = decoded.detach().cpu()
                         for idx in range(x_cpu.shape[0]):
