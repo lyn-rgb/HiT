@@ -295,6 +295,28 @@ python sample_hsit.py ODE \
   --outdir samples
 ```
 
+**sample_hsit.py arguments**
+
+- `--ckpt-levels`: Comma-separated list of HSIT checkpoints per level (required; length must equal `--num-levels`).
+- `--num-levels`: Number of hierarchical levels (must match HSIT/HVAE setup).
+- `--hvae-ckpt`: Optional hierarchical VAE checkpoint to align latent shapes.
+- `--sub-vae-configs`: Optional JSON string or JSON file path for sub-VAE configs.
+- `--vae`, `--vae-path`: Base VAE selection (diffusers format).
+- `--model`: HSIT backbone size (e.g., `SiT-XL/2`).
+- `--image-size`: Output image size (e.g., 256 or 512).
+- `--num-samples`: Number of samples (ignored if `--class-labels` is provided).
+- `--class-labels`: Comma-separated class labels to sample.
+- `--cfg-scale`: Classifier-free guidance scale.
+- `--use-ema` / `--no-use-ema`: Use EMA weights from checkpoints.
+- `--outdir`, `--outname`: Output directory and filename for the sample grid.
+
+**Sampler settings (ODE/SDE)**
+
+- `--sampling-method`, `--atol`, `--rtol`: ODE solver method and tolerances.
+- `--diffusion-form`, `--diffusion-norm`, `--last-step`, `--last-step-size`: SDE sampler controls.
+- `--num-sampling-steps`: Number of sampling steps.
+- `--path-type`, `--prediction`, `--loss-weight`, `--train-eps`, `--sample-eps`: Transport settings.
+
 We include a [`sample_ddp.py`](sample_ddp.py) script which samples a large number of images from a SiT model in parallel. This script 
 generates a folder of samples as well as a `.npz` file which can be directly used with [ADM's TensorFlow
 evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to compute FID, Inception Score and

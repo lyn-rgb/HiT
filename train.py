@@ -9,7 +9,9 @@ import warnings
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 import torch.distributed as dist
+torch.set_num_threads(1)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -278,6 +280,9 @@ def main(args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+        pin_memory_device=args.pin_memory_device,
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
@@ -477,7 +482,10 @@ if __name__ == "__main__":
                         help="Epsilon for Adam aux parameter group")
     parser.add_argument("--muon-aux-weight-decay", type=float, default=0.01,
                         help="Weight decay for Adam aux parameter group")
-    parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=32)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pin-memory-device", type=str, default="")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
