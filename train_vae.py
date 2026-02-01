@@ -27,6 +27,7 @@ import logging
 import os
 
 from vae import AutoencoderKL
+from muon import MuonWithAuxAdam
 import wandb_utils
 from log_utils import TrainingLogger
 from snapshot_utils import snapshot_code
@@ -152,7 +153,29 @@ def main(args):
     logger.info(f"VAE Parameters: {sum(p.numel() for p in vae.parameters()):,}")
 
     # Setup optimizer:
-    opt = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0)
+    if args.optimizer == "muon":
+        hidden_weights = [p for p in vae.parameters() if p.ndim >= 2]
+        hidden_gains_biases = [p for p in vae.parameters() if p.ndim < 2]
+        param_groups = [
+            dict(
+                params=hidden_weights,
+                use_muon=True,
+                lr=args.muon_lr,
+                momentum=args.muon_momentum,
+                weight_decay=args.muon_weight_decay,
+            ),
+            dict(
+                params=hidden_gains_biases,
+                use_muon=False,
+                lr=args.muon_aux_lr,
+                betas=tuple(args.muon_aux_betas),
+                eps=args.muon_aux_eps,
+                weight_decay=args.muon_aux_weight_decay,
+            ),
+        ]
+        opt = MuonWithAuxAdam(param_groups)
+    else:
+        opt = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0)
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
@@ -348,6 +371,24 @@ if __name__ == "__main__":
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
+    parser.add_argument("--optimizer", type=str, default="adamw",
+                        choices=["adamw", "muon"],
+                        help="Optimizer to use for training")
+    parser.add_argument("--muon-lr", type=float, default=0.02,
+                        help="Learning rate for Muon parameter group")
+    parser.add_argument("--muon-weight-decay", type=float, default=0.01,
+                        help="Weight decay for Muon parameter group")
+    parser.add_argument("--muon-momentum", type=float, default=0.95,
+                        help="Momentum for Muon parameter group")
+    parser.add_argument("--muon-aux-lr", type=float, default=3e-4,
+                        help="Learning rate for Adam aux parameter group")
+    parser.add_argument("--muon-aux-betas", type=float, nargs=2, default=(0.9, 0.95),
+                        metavar=("BETA1", "BETA2"),
+                        help="Betas for Adam aux parameter group")
+    parser.add_argument("--muon-aux-eps", type=float, default=1e-10,
+                        help="Epsilon for Adam aux parameter group")
+    parser.add_argument("--muon-aux-weight-decay", type=float, default=0.01,
+                        help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=50_000)

@@ -34,6 +34,7 @@ from transport import create_transport, Sampler
 from vae import AutoencoderKL
 from train_utils import parse_transport_args
 from data_utils import ParquetImageDataset, VAELatentDataset
+from muon import MuonWithAuxAdam
 import wandb_utils
 from log_utils import TrainingLogger
 from snapshot_utils import snapshot_code
@@ -82,6 +83,35 @@ def _format_eta(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def _build_muon_param_groups(model, args):
+    hidden_weights = [p for p in model.blocks.parameters() if p.ndim >= 2]
+    hidden_gains_biases = [p for p in model.blocks.parameters() if p.ndim < 2]
+    nonhidden_params = [
+        *model.x_embedder.parameters(),
+        *model.t_embedder.parameters(),
+        *model.y_embedder.parameters(),
+        *model.final_layer.parameters(),
+    ]
+    aux_params = hidden_gains_biases + nonhidden_params
+    param_groups = [
+        dict(
+            params=hidden_weights,
+            use_muon=True,
+            lr=args.muon_lr,
+            momentum=args.muon_momentum,
+            weight_decay=args.muon_weight_decay,
+        ),
+        dict(
+            params=aux_params,
+            use_muon=False,
+            lr=args.muon_aux_lr,
+            betas=tuple(args.muon_aux_betas),
+            eps=args.muon_aux_eps,
+            weight_decay=args.muon_aux_weight_decay,
+        ),
+    ]
+    return param_groups
 
 
 def center_crop_arr(pil_image, image_size):
@@ -167,12 +197,12 @@ def main(args):
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
+    state_dict = None
     if args.ckpt is not None:
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
         model.load_state_dict(state_dict["model"])
         ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
         args = state_dict["args"]
 
     requires_grad(ema, False)
@@ -194,7 +224,13 @@ def main(args):
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    if args.optimizer == "muon":
+        param_groups = _build_muon_param_groups(model.module, args)
+        opt = MuonWithAuxAdam(param_groups)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    if state_dict is not None:
+        opt.load_state_dict(state_dict["opt"])
     use_amp = args.amp_dtype != "fp32"
     autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
@@ -414,6 +450,24 @@ if __name__ == "__main__":
     parser.add_argument("--amp-dtype", type=str, default="fp32",
                         choices=["fp32", "fp16", "bf16"],
                         help="Enable mixed precision training with fp16 or bf16")
+    parser.add_argument("--optimizer", type=str, default="adamw",
+                        choices=["adamw", "muon"],
+                        help="Optimizer to use for training")
+    parser.add_argument("--muon-lr", type=float, default=0.02,
+                        help="Learning rate for Muon parameter group")
+    parser.add_argument("--muon-weight-decay", type=float, default=0.01,
+                        help="Weight decay for Muon parameter group")
+    parser.add_argument("--muon-momentum", type=float, default=0.95,
+                        help="Momentum for Muon parameter group")
+    parser.add_argument("--muon-aux-lr", type=float, default=3e-4,
+                        help="Learning rate for Adam aux parameter group")
+    parser.add_argument("--muon-aux-betas", type=float, nargs=2, default=(0.9, 0.95),
+                        metavar=("BETA1", "BETA2"),
+                        help="Betas for Adam aux parameter group")
+    parser.add_argument("--muon-aux-eps", type=float, default=1e-10,
+                        help="Epsilon for Adam aux parameter group")
+    parser.add_argument("--muon-aux-weight-decay", type=float, default=0.01,
+                        help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
