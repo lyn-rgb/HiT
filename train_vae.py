@@ -48,7 +48,8 @@ Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle la
 def pil_loader(path: str) -> Image.Image:
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, "rb") as f:
-        img = Image.open(f).load()
+        img = Image.open(f)
+        img.load()
         return img.convert("RGB")
 
 #################################################################################

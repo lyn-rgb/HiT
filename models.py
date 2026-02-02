@@ -25,6 +25,7 @@ class Attention(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         fa_version=None,
+        use_flash_attn=False,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -32,6 +33,7 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.fa_version = fa_version
+        self.use_flash_attn = use_flash_attn
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -43,7 +45,7 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
 
-        if x.is_cuda and q.size(-1) <= 256:
+        if self.use_flash_attn and x.is_cuda and q.size(-1) <= 256:
             dropout_p = self.attn_drop.p if self.training else 0.0
             dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
             attn = attention(
@@ -52,6 +54,7 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
                 dtype=dtype,
                 fa_version=self.fa_version,
+                use_flash_attn=self.use_flash_attn,
             )
         else:
             q = q.transpose(1, 2)
@@ -235,6 +238,7 @@ class SiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         fa_version=None,
+        use_flash_attn=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -251,7 +255,14 @@ class SiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, fa_version=fa_version) for _ in range(depth)
+            SiTBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                fa_version=fa_version,
+                use_flash_attn=use_flash_attn,
+            )
+            for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.grad_checkpointing = False
@@ -376,6 +387,7 @@ class HierarchicalSiT(nn.Module):
         fa_version=None,
         cond_input_size=None,
         cond_in_channels=4,
+        use_flash_attn=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -398,7 +410,13 @@ class HierarchicalSiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            HierarchicalSiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, fa_version=fa_version)
+            HierarchicalSiTBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                fa_version=fa_version,
+                use_flash_attn=use_flash_attn,
+            )
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)

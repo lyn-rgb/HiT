@@ -53,7 +53,8 @@ Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle la
 def pil_loader(path: str) -> Image.Image:
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, "rb") as f:
-        img = Image.open(f).load()
+        img = Image.open(f)
+        img.load()
         return img.convert("RGB")
 
 #################################################################################
@@ -239,6 +240,7 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes,
         fa_version=args.fa_version,
+        use_flash_attn=args.use_flash_attn,
     )
     if args.grad_checkpoint:
         model.set_grad_checkpointing(True)
@@ -576,7 +578,9 @@ if __name__ == "__main__":
     parser.add_argument("--log-all-ranks", action="store_true",
                         help="Log to stdout from all ranks (file logging stays rank 0 only)")
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
-                        help="Force FlashAttention version (2 or 3). Default uses available version.")
+                        help="Select FlashAttention version (2 or 3) when enabled.")
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable FlashAttention when available (off by default).")
     parser.add_argument("--save-code", action=argparse.BooleanOptionalAction, default=True,
                         help="Save a copy of the training code into the experiment folder")
     parser.add_argument("--run-notes", type=str, default="",

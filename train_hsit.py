@@ -53,7 +53,8 @@ Image.MAX_IMAGE_PIXELS = None  # Disable PIL decompression bomb limit; handle la
 def pil_loader(path: str) -> Image.Image:
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, "rb") as f:
-        img = Image.open(f).load()
+        img = Image.open(f)
+        img.load()
         return img.convert("RGB")
 
 #################################################################################
@@ -326,6 +327,7 @@ def main(args):
         in_channels=in_channels,
         num_classes=args.num_classes,
         fa_version=args.fa_version,
+        use_flash_attn=args.use_flash_attn,
         cond_input_size=cond_input_size,
         cond_in_channels=cond_in_channels,
     )
@@ -616,7 +618,9 @@ def parse_args():
     parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
                         help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
-                        help="FlashAttention version to use")
+                        help="Select FlashAttention version (2 or 3) when enabled.")
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable FlashAttention when available (off by default).")
     parser.add_argument("--grad-checkpoint", action="store_true",
                         help="Enable gradient checkpointing in the backbone")
 

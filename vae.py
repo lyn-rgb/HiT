@@ -210,6 +210,7 @@ class Attention(nn.Module):
         rescale_output_factor: float = 1.0,
         residual_connection: bool = False,
         fa_version: Optional[int] = None,
+        use_flash_attn: bool = False,
     ):
         super().__init__()
         inner_dim = heads * dim_head
@@ -220,6 +221,7 @@ class Attention(nn.Module):
         self.residual_connection = residual_connection
         self.rescale_output_factor = rescale_output_factor
         self.fa_version = fa_version
+        self.use_flash_attn = use_flash_attn
 
         self.group_norm = None
         if norm_num_groups is not None:
@@ -250,7 +252,7 @@ class Attention(nn.Module):
         k = k.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
         v = v.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
 
-        if hidden_states.is_cuda and q.size(-1) <= 256:
+        if self.use_flash_attn and hidden_states.is_cuda and q.size(-1) <= 256:
             dropout_p = self.to_out[1].p if self.training else 0.0
             dtype = hidden_states.dtype if hidden_states.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
             attn = attention(
@@ -261,6 +263,7 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
                 dtype=dtype,
                 fa_version=self.fa_version,
+                use_flash_attn=self.use_flash_attn,
             )
             hidden_states = attn.transpose(1, 2)
         else:

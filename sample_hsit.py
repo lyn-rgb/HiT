@@ -135,6 +135,7 @@ def main(args):
             in_channels=in_channels,
             num_classes=args.num_classes,
             fa_version=args.fa_version,
+            use_flash_attn=args.use_flash_attn,
             cond_input_size=cond_input_size,
             cond_in_channels=cond_in_channels,
         ).to(device)
@@ -209,7 +210,9 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--use-ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
-                        help="FlashAttention version to use")
+                        help="Select FlashAttention version (2 or 3) when enabled.")
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable FlashAttention when available (off by default).")
     parser.add_argument("--outdir", type=str, default="samples")
     parser.add_argument("--outname", type=str, default="hsit_sample.png")
 

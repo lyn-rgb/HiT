@@ -148,8 +148,9 @@ def attention(
     deterministic=False,
     dtype=torch.bfloat16,
     fa_version=None,
+    use_flash_attn=False,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if use_flash_attn and (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
         return flash_attention(
             q=q,
             k=k,

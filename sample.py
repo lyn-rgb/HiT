@@ -40,6 +40,7 @@ def main(mode, args):
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
         fa_version=args.fa_version,
+        use_flash_attn=args.use_flash_attn,
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
@@ -134,7 +135,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fa-version", type=int, default=None, choices=[2, 3],
-                        help="Force FlashAttention version (2 or 3). Default uses available version.")
+                        help="Select FlashAttention version (2 or 3) when enabled.")
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable FlashAttention when available (off by default).")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
