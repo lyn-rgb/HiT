@@ -142,7 +142,7 @@ def main(args):
     assert args.global_batch_size % dist.get_world_size() == 0, "Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank·
+    seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
@@ -199,12 +199,12 @@ def main(args):
         if rank == 0:
             logger.info(f"Resuming from checkpoint: {args.ckpt}")
             logger.info(f"Resume train_steps: {resume_train_steps}")
-    ema = deepcopy(vae).to(device)
+    vae = DDP(vae.to(device), device_ids=[device])
+    ema = deepcopy(vae.module).to(device)
     for p in ema.parameters():
         p.requires_grad = False
-    update_ema(ema, vae, decay=0)
+    update_ema(ema, vae.module, decay=0)
     ema.eval()
-    vae = DDP(vae.to(device), device_ids=[device])
     vae.train()
     logger.info(f"VAE Parameters: {sum(p.numel() for p in vae.parameters()):,}")
 
@@ -412,15 +412,10 @@ def main(args):
                     x_cpu = x.detach().cpu()
                     recon_cpu = recon.detach().cpu()
                     for idx in range(x_cpu.shape[0]):
+                        combined = torch.cat([x_cpu[idx], recon_cpu[idx]], dim=2)
                         save_image(
-                            x_cpu[idx],
-                            os.path.join(recon_dir, f"input_{idx:04d}.png"),
-                            normalize=True,
-                            value_range=(-1, 1),
-                        )
-                        save_image(
-                            recon_cpu[idx],
-                            os.path.join(recon_dir, f"recon_{idx:04d}.png"),
+                            combined,
+                            os.path.join(recon_dir, f"input_recon_{idx:04d}.png"),
                             normalize=True,
                             value_range=(-1, 1),
                         )
@@ -485,7 +480,7 @@ if __name__ == "__main__":
                         help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory-device", type=str, default="")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=50_000)
@@ -504,7 +499,7 @@ if __name__ == "__main__":
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a VAE checkpoint to resume from")
-    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False,
                         help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     args = parser.parse_args()

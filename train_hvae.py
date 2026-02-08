@@ -249,22 +249,33 @@ def main(args):
     sub_vae_configs = load_json_arg(args.sub_vae_configs, "sub_vae_configs")
     hvae = HierarchicalVAE(base_vae=base_vae, num_levels=args.num_levels, sub_vae_configs=sub_vae_configs)
     resume_train_steps = 0
+    resume = False
     if args.ckpt is not None:
         state = torch.load(args.ckpt, map_location="cpu")
-        hvae.load_state_dict(state["model"])
-        resume_train_steps = state.get("train_steps", 0)
-        if rank == 0:
-            logger.info(f"Resuming from checkpoint: {args.ckpt}")
-            logger.info(f"Resume train_steps: {resume_train_steps}")
+        resume = (state["train_level"] == args.train_level)
+        if resume:
+            hvae.load_state_dict(state["model"])
+            resume_train_steps = state.get("train_steps", 0)
+            if rank == 0:
+                logger.info(f"Resuming from checkpoint: {args.ckpt}")
+                logger.info(f"Resume train_steps: {resume_train_steps}")
+        else:
+            if "ema" in state:
+                hvae.load_state_dict(state["ema"])
+            else:
+                hvae.load_state_dict(state["model"])
+            if rank == 0:
+                logger.info(f"Loading weights of level {state['train_level']} from checkpoint: {args.ckpt}")
+
     hvae = hvae.to(device)
-    ema = deepcopy(hvae).to(device)
+    hvae = DDP(hvae, device_ids=[device])
+    ema = deepcopy(hvae.module).to(device)
     for p in ema.parameters():
         p.requires_grad = False
-    update_ema(ema, hvae, decay=0)
+    update_ema(ema, hvae.module, decay=0)
     ema.eval()
-    if args.ckpt is not None and "ema" in state:
+    if resume and "ema" in state:
         ema.load_state_dict(state["ema"])
-    hvae = DDP(hvae, device_ids=[device])
     hvae.train()
 
     # Freeze non-target levels:
@@ -326,7 +337,7 @@ def main(args):
     def amp_autocast():
         return torch.cuda.amp.autocast(dtype=autocast_dtype) if use_amp else nullcontext()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp_dtype == "fp16")
-    if args.ckpt is not None and "opt" in state:
+    if resume and "opt" in state:
         opt.load_state_dict(state["opt"])
 
     def _save_last_ckpt():
@@ -511,33 +522,23 @@ def main(args):
                         x_cpu = x.detach().cpu()
                         recon_cpu = recon.detach().cpu()
                         for idx in range(x_cpu.shape[0]):
+                            combined = torch.cat([x_cpu[idx], recon_cpu[idx]], dim=2)
                             save_image(
-                                x_cpu[idx],
-                                os.path.join(recon_dir, f"input_{idx:04d}.png"),
-                                normalize=True,
-                                value_range=(-1, 1),
-                            )
-                            save_image(
-                                recon_cpu[idx],
-                                os.path.join(recon_dir, f"recon_{idx:04d}.png"),
+                                combined,
+                                os.path.join(recon_dir, f"input_recon_{idx:04d}.png"),
                                 normalize=True,
                                 value_range=(-1, 1),
                             )
                     else:
-                        with torch.no_grad():
-                            decoded = hvae.module.decode_from_level(recon, target_level, assume_scaled=False)
+                        with torch.no_grad(), amp_autocast():
+                            decoded = hvae.module.decode_from_level(z, target_level, assume_scaled=False)
                         x_cpu = x.detach().cpu()
                         decoded_cpu = decoded.detach().cpu()
                         for idx in range(x_cpu.shape[0]):
+                            combined = torch.cat([x_cpu[idx], decoded_cpu[idx]], dim=2)
                             save_image(
-                                x_cpu[idx],
-                                os.path.join(recon_dir, f"input_{idx:04d}.png"),
-                                normalize=True,
-                                value_range=(-1, 1),
-                            )
-                            save_image(
-                                decoded_cpu[idx],
-                                os.path.join(recon_dir, f"recon_{idx:04d}.png"),
+                                combined,
+                                os.path.join(recon_dir, f"input_recon_{idx:04d}.png"),
                                 normalize=True,
                                 value_range=(-1, 1),
                             )
@@ -608,7 +609,7 @@ if __name__ == "__main__":
                         help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory-device", type=str, default="")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=50_000)
@@ -635,7 +636,7 @@ if __name__ == "__main__":
                         help="Free-form notes describing the training setup")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a hierarchical VAE checkpoint to resume from")
-    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False,
                         help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     args = parser.parse_args()

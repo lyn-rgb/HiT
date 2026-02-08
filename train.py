@@ -565,7 +565,7 @@ if __name__ == "__main__":
                         help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory-device", type=str, default="")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
@@ -589,7 +589,7 @@ if __name__ == "__main__":
                         help="Enable gradient checkpointing to reduce GPU memory usage")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
-    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False,
                         help="Auto-resume from the most recent checkpoint in results-dir if no --ckpt is provided")
 
     parse_transport_args(parser)

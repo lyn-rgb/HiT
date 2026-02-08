@@ -597,7 +597,7 @@ def parse_args():
                         help="Weight decay for Adam aux parameter group")
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory-device", type=str, default="")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=10_000)
