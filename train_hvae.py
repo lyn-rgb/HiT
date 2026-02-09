@@ -161,24 +161,6 @@ def load_json_arg(value, name):
         raise ValueError(f"{name} must be a JSON string or a path to a JSON file.") from exc
 
 
-def _sample_latent(posterior, noise_scale: float):
-    if noise_scale == 0.0:
-        return posterior.mean
-    eps = torch.randn_like(posterior.mean)
-    return posterior.mean + eps * posterior.std * noise_scale
-
-
-def compute_latent_for_level(hvae, x, level, noise_scale: float):
-    posterior = hvae.base_vae.encode(x).latent_dist
-    latent = _sample_latent(posterior, noise_scale)
-    for i in range(level - 1):
-        sub_posterior = hvae.sub_vaes[i].encode(latent).latent_dist
-        latent = _sample_latent(sub_posterior, noise_scale)
-    return latent
-
-
-
-
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -429,18 +411,22 @@ def main(args):
             x = x.to(device)
             with amp_autocast():
                 if target_level == 0:
-                    posterior = hvae.module.base_vae.encode(x).latent_dist
+                    posterior = hvae(x, mode="base_encode").latent_dist
                     z = posterior.sample()
-                    recon = hvae.module.base_vae.decode(z).sample
+                    recon = hvae(mode="base_decode", latent=z).sample
                     recon_loss = torch.mean((recon - x) ** 2)
                     kl_loss = posterior.kl().mean()
                 else:
                     with torch.no_grad():
-                        mu = compute_latent_for_level(hvae.module, x, target_level, args.input_noise_scale)
-                    sub_vae = hvae.module.sub_vaes[target_level - 1]
-                    posterior = sub_vae.encode(mu).latent_dist
+                        mu = hvae(
+                            x,
+                            mode="latent_for_level",
+                            level=target_level,
+                            noise_scale=args.input_noise_scale,
+                        )
+                    posterior = hvae(mu, mode="sub_encode", level=target_level).latent_dist
                     z = posterior.sample()
-                    recon = sub_vae.decode(z).sample
+                    recon = hvae(mode="sub_decode", latent=z, level=target_level).sample
                     recon_loss = torch.mean((recon - mu) ** 2)
                     kl_loss = posterior.kl().mean()
 
@@ -531,7 +517,12 @@ def main(args):
                             )
                     else:
                         with torch.no_grad(), amp_autocast():
-                            decoded = hvae.module.decode_from_level(z, target_level, assume_scaled=False)
+                            decoded = hvae(
+                                mode="decode_from_level",
+                                latent=z,
+                                level=target_level,
+                                assume_scaled=False,
+                            )
                         x_cpu = x.detach().cpu()
                         decoded_cpu = decoded.detach().cpu()
                         for idx in range(x_cpu.shape[0]):

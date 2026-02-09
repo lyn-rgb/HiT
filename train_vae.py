@@ -330,9 +330,9 @@ def main(args):
         for x, _ in loader:
             x = x.to(device)
             with amp_autocast():
-                posterior = vae.module.encode(x).latent_dist
+                posterior = vae(x, mode="encode").latent_dist
                 z = posterior.sample()
-                recon = vae.module.decode(z).sample
+                recon = vae(mode="decode", latent=z).sample
                 recon_loss = torch.mean((recon - x) ** 2)
                 kl_loss = posterior.kl().mean()
                 loss = recon_loss + args.kl_weight * kl_loss

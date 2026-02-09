@@ -659,10 +659,28 @@ class AutoencoderKL(nn.Module):
         dec = self.decoder(z)
         return DecoderOutput(sample=dec)
 
-    def forward(self, sample: torch.Tensor) -> DecoderOutput:
-        posterior = self.encode(sample).latent_dist
-        z = posterior.sample()
-        return self.decode(z)
+    def forward(
+        self,
+        sample: Optional[torch.Tensor] = None,
+        *,
+        mode: str = "full",
+        latent: Optional[torch.Tensor] = None,
+    ) -> DecoderOutput | AutoencoderKLOutput:
+        if mode == "full":
+            if sample is None:
+                raise ValueError("sample is required when mode='full'.")
+            posterior = self.encode(sample).latent_dist
+            z = posterior.sample()
+            return self.decode(z)
+        if mode == "encode":
+            if sample is None:
+                raise ValueError("sample is required when mode='encode'.")
+            return self.encode(sample)
+        if mode == "decode":
+            if latent is None:
+                raise ValueError("latent is required when mode='decode'.")
+            return self.decode(latent)
+        raise ValueError(f"Unsupported mode for AutoencoderKL.forward: {mode}")
 
     @classmethod
     def from_pretrained(cls, pretrained_path: str) -> "AutoencoderKL":
@@ -761,33 +779,91 @@ class HierarchicalVAE(nn.Module):
             "use_post_quant_conv": base_config["use_post_quant_conv"],
         }
 
-    def forward(self, sample: torch.Tensor) -> HierarchicalVAEOutput:
+    @staticmethod
+    def _sample_latent(posterior: DiagonalGaussianDistribution, noise_scale: float) -> torch.Tensor:
+        if noise_scale == 0.0:
+            return posterior.mean
+        eps = torch.randn_like(posterior.mean)
+        return posterior.mean + eps * posterior.std * noise_scale
+
+    def _latent_for_level(self, sample: torch.Tensor, level: int, noise_scale: float) -> torch.Tensor:
+        if level <= 0 or level >= self.num_levels:
+            raise ValueError(f"level must be in [1, {self.num_levels - 1}], got {level}")
         posterior = self.base_vae.encode(sample).latent_dist
-        mu = posterior.mean
-        z = posterior.sample()
-        recon = self.base_vae.decode(z).sample
+        latent = self._sample_latent(posterior, noise_scale)
+        for i in range(level - 1):
+            sub_posterior = self.sub_vaes[i].encode(latent).latent_dist
+            latent = self._sample_latent(sub_posterior, noise_scale)
+        return latent
 
-        sub_posteriors = []
-        sub_mus = []
-        sub_recons = []
-        input_mu = mu
-        for sub_vae in self.sub_vaes:
-            sub_posterior = sub_vae.encode(input_mu).latent_dist
-            sub_posteriors.append(sub_posterior)
-            sub_mus.append(sub_posterior.mean)
-            sub_z = sub_posterior.sample()
-            sub_recon = sub_vae.decode(sub_z).sample
-            sub_recons.append(sub_recon)
-            input_mu = sub_posterior.mean
+    def forward(
+        self,
+        sample: Optional[torch.Tensor] = None,
+        *,
+        mode: str = "full",
+        latent: Optional[torch.Tensor] = None,
+        level: int = 0,
+        noise_scale: float = 1.0,
+        assume_scaled: bool = True,
+    ) -> HierarchicalVAEOutput | AutoencoderKLOutput | DecoderOutput | torch.Tensor:
+        if mode == "full":
+            if sample is None:
+                raise ValueError("sample is required when mode='full'.")
+            posterior = self.base_vae.encode(sample).latent_dist
+            mu = posterior.mean
+            z = posterior.sample()
+            recon = self.base_vae.decode(z).sample
 
-        return HierarchicalVAEOutput(
-            recon=recon,
-            posterior=posterior,
-            mu=mu,
-            sub_posteriors=tuple(sub_posteriors),
-            sub_mus=tuple(sub_mus),
-            sub_recons=tuple(sub_recons),
-        )
+            sub_posteriors = []
+            sub_mus = []
+            sub_recons = []
+            input_mu = mu
+            for sub_vae in self.sub_vaes:
+                sub_posterior = sub_vae.encode(input_mu).latent_dist
+                sub_posteriors.append(sub_posterior)
+                sub_mus.append(sub_posterior.mean)
+                sub_z = sub_posterior.sample()
+                sub_recon = sub_vae.decode(sub_z).sample
+                sub_recons.append(sub_recon)
+                input_mu = sub_posterior.mean
+
+            return HierarchicalVAEOutput(
+                recon=recon,
+                posterior=posterior,
+                mu=mu,
+                sub_posteriors=tuple(sub_posteriors),
+                sub_mus=tuple(sub_mus),
+                sub_recons=tuple(sub_recons),
+            )
+        if mode == "base_encode":
+            if sample is None:
+                raise ValueError("sample is required when mode='base_encode'.")
+            return self.base_vae.encode(sample)
+        if mode == "base_decode":
+            if latent is None:
+                raise ValueError("latent is required when mode='base_decode'.")
+            return self.base_vae.decode(latent)
+        if mode == "sub_encode":
+            if sample is None:
+                raise ValueError("sample is required when mode='sub_encode'.")
+            if level <= 0 or level >= self.num_levels:
+                raise ValueError(f"level must be in [1, {self.num_levels - 1}], got {level}")
+            return self.sub_vaes[level - 1].encode(sample)
+        if mode == "sub_decode":
+            if latent is None:
+                raise ValueError("latent is required when mode='sub_decode'.")
+            if level <= 0 or level >= self.num_levels:
+                raise ValueError(f"level must be in [1, {self.num_levels - 1}], got {level}")
+            return self.sub_vaes[level - 1].decode(latent)
+        if mode == "latent_for_level":
+            if sample is None:
+                raise ValueError("sample is required when mode='latent_for_level'.")
+            return self._latent_for_level(sample, level, noise_scale)
+        if mode == "decode_from_level":
+            if latent is None:
+                raise ValueError("latent is required when mode='decode_from_level'.")
+            return self.decode_from_level(latent, level, assume_scaled=assume_scaled)
+        raise ValueError(f"Unsupported mode for HierarchicalVAE.forward: {mode}")
 
     def decode_from_level(self, latent: torch.Tensor, level: int, assume_scaled: bool = True) -> torch.Tensor:
         if level < 0 or level >= self.num_levels:
