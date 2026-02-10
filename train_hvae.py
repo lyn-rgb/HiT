@@ -250,7 +250,7 @@ def main(args):
                 logger.info(f"Loading weights of level {state['train_level']} from checkpoint: {args.ckpt}")
 
     hvae = hvae.to(device)
-    hvae = DDP(hvae, device_ids=[device])
+    hvae = DDP(hvae, device_ids=[device], find_unused_parameters=True)
     ema = deepcopy(hvae.module).to(device)
     for p in ema.parameters():
         p.requires_grad = False
@@ -272,24 +272,36 @@ def main(args):
             sub_vae.eval()
 
     train_params = [p for p in hvae.parameters() if p.requires_grad]
-    logger.info(f"Trainable parameters: {sum(p.numel() for p in train_params):,}")
+    total_params = sum(p.numel() for p in hvae.parameters())
+    logger.info(f"Trainable/(Total) parameters: {sum(p.numel() for p in train_params):,}/({total_params:,})")
 
     # Setup optimizer:
     level_lrs = parse_csv_floats(args.level_lrs, "level_lrs")
     level_recon_weights = parse_csv_floats(args.level_recon_weights, "level_recon_weights")
     level_kl_weights = parse_csv_floats(args.level_kl_weights, "level_kl_weights")
+    level_pixel_recon_weights = parse_csv_floats(
+        args.level_pixel_recon_weights,
+        "level_pixel_recon_weights",
+    )
     if level_lrs is not None and len(level_lrs) != args.num_levels:
         raise ValueError("level_lrs must have exactly num_levels entries.")
     if level_recon_weights is not None and len(level_recon_weights) != args.num_levels:
         raise ValueError("level_recon_weights must have exactly num_levels entries.")
     if level_kl_weights is not None and len(level_kl_weights) != args.num_levels:
         raise ValueError("level_kl_weights must have exactly num_levels entries.")
+    if level_pixel_recon_weights is not None and len(level_pixel_recon_weights) != args.num_levels:
+        raise ValueError("level_pixel_recon_weights must have exactly num_levels entries.")
 
     lr = level_lrs[target_level] if level_lrs is not None else args.lr
     recon_weight = (
         level_recon_weights[target_level] if level_recon_weights is not None else 1.0
     )
     kl_weight = level_kl_weights[target_level] if level_kl_weights is not None else args.kl_weight
+    pixel_recon_weight = (
+        level_pixel_recon_weights[target_level]
+        if level_pixel_recon_weights is not None
+        else args.pixel_recon_weight
+    )
 
     if args.optimizer == "muon":
         hidden_weights = [p for p in train_params if p.ndim >= 2]
@@ -388,6 +400,7 @@ def main(args):
     running_loss = 0.0
     running_recon = 0.0
     running_kl = 0.0
+    running_pixel_recon = 0.0
     steps_per_epoch = len(batch_sampler)
     total_steps = args.epochs * steps_per_epoch
     start_epoch = train_steps // steps_per_epoch
@@ -410,6 +423,7 @@ def main(args):
         for x, _ in loader:
             x = x.to(device)
             with amp_autocast():
+                pixel_recon_loss = torch.tensor(0.0, device=device)
                 if target_level == 0:
                     posterior = hvae(x, mode="base_encode").latent_dist
                     z = posterior.sample()
@@ -429,8 +443,18 @@ def main(args):
                     recon = hvae(mode="sub_decode", latent=z, level=target_level).sample
                     recon_loss = torch.mean((recon - mu) ** 2)
                     kl_loss = posterior.kl().mean()
+                    if args.pixel_recon:
+                        pixel_recon = hvae(
+                            mode="decode_from_level",
+                            latent=z,
+                            level=target_level,
+                            assume_scaled=False,
+                        )
+                        pixel_recon_loss = torch.mean((pixel_recon - x) ** 2)
 
                 loss = recon_weight * recon_loss + kl_weight * kl_loss
+                if args.pixel_recon and target_level > 0:
+                    loss = loss + pixel_recon_weight * pixel_recon_loss
 
             opt.zero_grad()
             if scaler.is_enabled():
@@ -446,6 +470,7 @@ def main(args):
             running_loss += loss.item()
             running_recon += recon_loss.item()
             running_kl += kl_loss.item()
+            running_pixel_recon += pixel_recon_loss.item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -461,17 +486,21 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_recon = torch.tensor(running_recon / log_steps, device=device)
                 avg_kl = torch.tensor(running_kl / log_steps, device=device)
+                avg_pixel_recon = torch.tensor(running_pixel_recon / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_recon, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_kl, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_pixel_recon, op=dist.ReduceOp.SUM)
                 world_size = dist.get_world_size()
                 avg_loss = avg_loss.item() / world_size
                 avg_recon = avg_recon.item() / world_size
                 avg_kl = avg_kl.item() / world_size
+                avg_pixel_recon = avg_pixel_recon.item() / world_size
 
                 logger.info(
                     f"(step={train_steps:07d}) "
                     f"Loss: {avg_loss:.6f}, Recon: {avg_recon:.6f}, KL: {avg_kl:.6f}, "
+                    f"PixelRecon: {avg_pixel_recon:.6f}, "
                     f"Steps/Sec: {steps_per_sec:.2f}, ETA: {eta_str}"
                 )
                 if args.wandb:
@@ -480,6 +509,7 @@ def main(args):
                             "loss": avg_loss,
                             "recon": avg_recon,
                             "kl": avg_kl,
+                            "pixel_recon": avg_pixel_recon,
                             "steps/sec": steps_per_sec
                         },
                         step=train_steps
@@ -490,6 +520,7 @@ def main(args):
                         "train/loss": avg_loss,
                         "train/recon": avg_recon,
                         "train/kl": avg_kl,
+                        "train/pixel_recon": avg_pixel_recon,
                         "train/steps_per_sec": steps_per_sec,
                     },
                     train_steps,
@@ -497,6 +528,7 @@ def main(args):
                 running_loss = 0.0
                 running_recon = 0.0
                 running_kl = 0.0
+                running_pixel_recon = 0.0
                 log_steps = 0
                 start_time = time()
 
@@ -616,6 +648,12 @@ if __name__ == "__main__":
                         help="Comma-separated recon loss weights per level (length=num_levels)")
     parser.add_argument("--level-kl-weights", type=str, default=None,
                         help="Comma-separated KL loss weights per level (length=num_levels)")
+    parser.add_argument("--pixel-recon", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable pixel-level reconstruction loss when training sub-VAE levels")
+    parser.add_argument("--pixel-recon-weight", type=float, default=1.0,
+                        help="Weight for pixel-level reconstruction loss")
+    parser.add_argument("--level-pixel-recon-weights", type=str, default=None,
+                        help="Comma-separated pixel reconstruction weights per level (length=num_levels)")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--tensorboard", action="store_true",
                         help="Enable TensorBoard logging (rank 0 only)")
